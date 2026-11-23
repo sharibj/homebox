@@ -76,6 +76,10 @@ docker run -d \
 # ghcr.io/sysadminsmedia/homebox:latest-hardened
 ```
 
+## Optional inventory companion
+
+This fork includes a separate mobile companion for chat, reviewed photo intake, and NFC/QR links. Homebox remains the inventory system of record. See the [companion setup and limitations](docs/assistant/README.md) and [isolated Docker deployment](deploy/README.md).
+
 <!-- CONTRIBUTING -->
 
 ## Contributing

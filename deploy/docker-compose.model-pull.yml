@@ -1,0 +1,9 @@
+# Deliberate, temporary egress for an operator-requested model download.
+# Remove this override from `up` after the pull; the default is inference-only.
+services:
+  ollama:
+    networks:
+      - inference
+      - model_download
+networks:
+  model_download: {}

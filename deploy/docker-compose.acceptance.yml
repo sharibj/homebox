@@ -1,0 +1,39 @@
+# Disposable localhost-only integration, never an override for an existing install.
+# Requires Compose >=2.24.4 for !override. Every value below is test-only.
+name: ${ACCEPTANCE_PROJECT:?Set a unique homebox-acceptance-* project name}
+
+services:
+  proxy:
+    ports: !override
+      - "127.0.0.1:${ACCEPTANCE_PORT:-8088}:8088/tcp"
+      - "127.0.0.1:${ACCEPTANCE_HOMEBOX_PORT:-8089}:8089/tcp"
+    volumes:
+      - ./reverse-proxy/Caddyfile.acceptance:/etc/caddy/Caddyfile:ro
+  homebox:
+    # Require an explicit image. An unproven cached image is a compatibility
+    # fixture, not proof that this source revision built or passed acceptance.
+    image: ${ACCEPTANCE_HOMEBOX_IMAGE:?Set the tested Homebox image reference}
+    environment:
+      HBOX_OPTIONS_HOSTNAME: localhost:${ACCEPTANCE_HOMEBOX_PORT:-8089}
+      HBOX_OPTIONS_ALLOW_REGISTRATION: "true"
+  assistant-api:
+    environment:
+      ASSISTANT_PUBLIC_ORIGIN: http://localhost:${ACCEPTANCE_PORT:-8088}
+      HOMEBOX_PUBLIC_ORIGIN: http://localhost:${ACCEPTANCE_HOMEBOX_PORT:-8089}
+      ASSISTANT_ALLOW_INSECURE_HTTP: "true"
+  ollama:
+    profiles: [model]
+  backup:
+    volumes:
+      - ${ACCEPTANCE_SECRETS_DIR}:/snapshot/secrets:ro
+      - ${ACCEPTANCE_ENV_FILE:?Set the acceptance environment file path}:/snapshot/config.env:ro
+      - ${ACCEPTANCE_BACKUP_DIR:?Set the acceptance backup directory}:/backups
+      - ./reverse-proxy/Caddyfile.acceptance:/snapshot/Caddyfile:ro
+
+secrets:
+  homebox_api_pepper:
+    file: ${ACCEPTANCE_SECRETS_DIR:?Use a separate generated acceptance secret directory}/homebox_api_pepper
+  assistant_session_secret:
+    file: ${ACCEPTANCE_SECRETS_DIR}/assistant_session_secret
+  mcp_shared_secret:
+    file: ${ACCEPTANCE_SECRETS_DIR}/mcp_shared_secret

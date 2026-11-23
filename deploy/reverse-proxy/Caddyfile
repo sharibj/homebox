@@ -1,0 +1,57 @@
+{
+	admin off
+	log {
+		level WARN
+	}
+	servers {
+		protocols h1 h2
+	}
+}
+
+(transport_security) {
+	tls {
+		issuer {$TLS_ISSUER:internal}
+	}
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		Strict-Transport-Security "max-age=86400"
+		-X-Powered-By
+		-Server
+	}
+}
+
+{$HOMEBOX_HOST} {
+	import transport_security
+	reverse_proxy homebox:7745
+}
+
+{$ASSISTANT_HOST} {
+	import transport_security
+	header {
+		Permissions-Policy "camera=(self), microphone=(), geolocation=()"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+	}
+	@assistant_api path /api/assistant/v1 /api/assistant/v1/*
+	handle @assistant_api {
+		header Cache-Control no-store
+		request_body {
+			max_size 16MB
+		}
+		# Preserve the prefix, Cookie, Origin, CSRF, and idempotency headers.
+		reverse_proxy assistant-api:8000
+	}
+	handle /api/* {
+		respond "Not found" 404
+	}
+	handle {
+		# Includes /t/<tagId>; the static server supplies the SPA fallback.
+		reverse_proxy pwa:8080
+	}
+}
+
+# Container-only liveness listener, not a published host port.
+http://:8081 {
+	bind 127.0.0.1
+	respond /healthz "ok" 200
+}
