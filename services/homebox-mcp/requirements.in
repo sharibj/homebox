@@ -1,0 +1,6 @@
+homebox-mcp==1.5.1
+mcp==2.3.0
+fastapi==0.165.0
+uvicorn
+pytest
+respx
