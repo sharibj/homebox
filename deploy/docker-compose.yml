@@ -1,0 +1,264 @@
+name: homebox-inventory
+
+x-service: &service
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-python-health: &python-health
+  interval: 30s
+  timeout: 8s
+  start_period: 30s
+  retries: 3
+
+services:
+  proxy:
+    <<: *service
+    image: caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
+    read_only: true
+    environment:
+      HOMEBOX_HOST: ${HOMEBOX_HOST:?Set HOMEBOX_HOST in deploy/.env}
+      ASSISTANT_HOST: ${ASSISTANT_HOST:?Set ASSISTANT_HOST in deploy/.env}
+      TLS_ISSUER: ${TLS_ISSUER:-internal}
+    ports:
+      - "${PROXY_BIND_IP:-127.0.0.1}:80:80/tcp"
+      - "${PROXY_BIND_IP:-127.0.0.1}:443:443/tcp"
+    volumes:
+      - ./reverse-proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    networks: [edge, browser, homebox_ui]
+    depends_on:
+      homebox:
+        condition: service_healthy
+      assistant-api:
+        condition: service_healthy
+      pwa:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+
+  homebox:
+    <<: *service
+    image: homebox-inventory:${STACK_VERSION:?Set STACK_VERSION in deploy/.env}
+    pull_policy: never
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.homebox
+      args:
+        COMMIT: ${SOURCE_REVISION:-unknown}
+    read_only: true
+    cap_drop: [ALL]
+    environment:
+      HBOX_MODE: production
+      HBOX_LOG_LEVEL: info
+      HBOX_WEB_PORT: "7745"
+      HBOX_OPTIONS_HOSTNAME: ${HOMEBOX_HOST}
+      HBOX_OPTIONS_TRUST_PROXY: "true"
+      HBOX_OPTIONS_ALLOW_REGISTRATION: ${HBOX_ALLOW_REGISTRATION:-false}
+      HBOX_OPTIONS_ALLOW_ANALYTICS: "false"
+      HBOX_OPTIONS_GITHUB_RELEASE_CHECK: "false"
+      HBOX_AUTH_API_KEY_PEPPER_FILE: /run/secrets/homebox_api_pepper
+    secrets: [homebox_api_pepper]
+    volumes:
+      - homebox_data:/data
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    networks: [homebox_ui, inventory]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7745/api/v1/status"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    cpus: 2
+    mem_limit: 1536m
+    pids_limit: 256
+
+  assistant-api:
+    <<: *service
+    image: homebox-inventory-assistant:${STACK_VERSION}
+    pull_policy: never
+    build:
+      context: ../apps/assistant-api
+    read_only: true
+    cap_drop: [ALL]
+    environment:
+      HOMEBOX_URL: http://homebox:7745
+      HOMEBOX_INSTANCE_ID: ${HOMEBOX_INSTANCE_ID:?Run deploy/scripts/init-config.sh first}
+      ASSISTANT_MCP_URL: http://homebox-mcp:8001/mcp
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3-vl:2b}
+      ASSISTANT_PUBLIC_ORIGIN: https://${ASSISTANT_HOST}
+      HOMEBOX_PUBLIC_ORIGIN: https://${HOMEBOX_HOST}
+      ASSISTANT_STATE_PATH: /data/assistant.db
+      ASSISTANT_UPLOAD_DIR: /data/uploads
+      ASSISTANT_SESSION_SECRET_FILE: /run/secrets/assistant_session_secret
+      MCP_SHARED_SECRET_FILE: /run/secrets/mcp_shared_secret
+      ASSISTANT_ALLOW_INSECURE_HTTP: "false"
+      ASSISTANT_MAX_UPLOAD_BYTES: "12582912"
+      ASSISTANT_MAX_IMAGE_PIXELS: "24000000"
+      ASSISTANT_IMAGE_MAX_EDGE: "1024"
+      ASSISTANT_SESSION_TTL_SECONDS: "28800"
+      ASSISTANT_ACTION_TTL_SECONDS: "900"
+      ASSISTANT_CAPTURE_TTL_SECONDS: "3600"
+    secrets: [assistant_session_secret, mcp_shared_secret]
+    volumes:
+      - assistant_data:/data
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    networks: [browser, inventory, tools, inference]
+    depends_on:
+      homebox:
+        condition: service_healthy
+      homebox-mcp:
+        condition: service_healthy
+    # Ollama deliberately does not gate readiness or manual/search workflows.
+    healthcheck:
+      <<: *python-health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=6).read()"]
+    cpus: 2
+    mem_limit: 1g
+    pids_limit: 256
+
+  homebox-mcp:
+    <<: *service
+    image: homebox-inventory-mcp:${STACK_VERSION}
+    pull_policy: never
+    build:
+      context: ../services/homebox-mcp
+    read_only: true
+    cap_drop: [ALL]
+    environment:
+      HOMEBOX_URL: http://homebox:7745
+      MCP_SHARED_SECRET_FILE: /run/secrets/mcp_shared_secret
+    secrets: [mcp_shared_secret]
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    networks: [tools, inventory]
+    depends_on:
+      homebox:
+        condition: service_healthy
+    healthcheck:
+      <<: *python-health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/readyz', timeout=6).read()"]
+    cpus: 1
+    mem_limit: 512m
+    pids_limit: 128
+
+  pwa:
+    <<: *service
+    image: homebox-inventory-pwa:${STACK_VERSION}
+    pull_policy: never
+    build:
+      context: ../apps/pwa
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    networks: [browser]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    cpus: 0.5
+    mem_limit: 128m
+    pids_limit: 64
+
+  ollama:
+    <<: *service
+    image: ollama/ollama:0.40.17@sha256:ccc42bcd3d5fcf7ab0d532b300382154e1a4da56fc666bdb313b78ebdd912754
+    read_only: true
+    cap_drop: [ALL]
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_CONTEXT_LENGTH: "4096"
+      OLLAMA_MAX_QUEUE: "2"
+      OLLAMA_KEEP_ALIVE: "5m"
+      OLLAMA_NO_CLOUD: "1"
+    volumes:
+      - ollama_data:/root/.ollama
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    networks: [inference]
+    healthcheck:
+      test: ["CMD-SHELL", "OLLAMA_HOST=127.0.0.1:11434 ollama list >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    cpus: ${OLLAMA_CPUS:-4}
+    mem_limit: ${OLLAMA_MEMORY:-8g}
+    pids_limit: 256
+
+  backup:
+    image: alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+    profiles: [operations]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [DAC_READ_SEARCH, CHOWN]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - homebox_data:/snapshot/homebox:ro
+      - assistant_data:/snapshot/assistant:ro
+      - caddy_data:/snapshot/proxy-data:ro
+      - caddy_config:/snapshot/proxy-config:ro
+      - ./secrets:/snapshot/secrets:ro
+      - ./.env:/snapshot/config.env:ro
+      - ./docker-compose.yml:/snapshot/docker-compose.yml:ro
+      - ./reverse-proxy/Caddyfile:/snapshot/Caddyfile:ro
+      - ./backups:/backups
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command: ["echo 'Use deploy/scripts/backup.sh, which stops writers before taking a snapshot.' >&2; exit 1"]
+    cpus: 1
+    mem_limit: 128m
+    pids_limit: 32
+
+networks:
+  # Only Caddy has normal egress, for certificate issuance.
+  edge: {}
+  browser:
+    internal: true
+  homebox_ui:
+    internal: true
+  inventory:
+    internal: true
+  tools:
+    internal: true
+  inference:
+    internal: true
+
+volumes:
+  homebox_data:
+  assistant_data:
+  ollama_data:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  homebox_api_pepper:
+    file: ./secrets/homebox_api_pepper
+  assistant_session_secret:
+    file: ./secrets/assistant_session_secret
+  mcp_shared_secret:
+    file: ./secrets/mcp_shared_secret

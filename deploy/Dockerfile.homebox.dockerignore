@@ -1,0 +1,14 @@
+**
+!backend/
+!backend/**
+!frontend/
+!frontend/**
+**/.git
+**/.env*
+**/node_modules
+**/.nuxt
+**/.output
+**/.data
+**/*.db
+**/*.db-shm
+**/*.db-wal
