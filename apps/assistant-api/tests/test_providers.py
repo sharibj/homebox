@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import traceback
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -11,6 +12,7 @@ import respx
 from PIL import Image
 from pydantic import ValidationError
 
+from assistant.clients import ServiceError
 from assistant.config import Config
 from assistant.images import VisionClient, normalize
 from assistant.provider_config import ProviderRoles
@@ -568,3 +570,130 @@ def test_native_vision_real_client_schema_repair_shared_provider_and_close_once(
         assert payloads[0]["messages"] == payloads[1]["messages"]
         assert payloads[0]["system"] != payloads[1]["system"]
         assert "Return only one JSON object that exactly matches the requested schema." in payloads[1]["system"]
+
+
+def intent_config(tmp_path, timeout):
+    cfg = Config.load()
+    cfg.state = tmp_path / "synthetic-intent.db"
+    cfg.chat_timeout = timeout
+    settings = ProviderSettings("ollama", "http://synthetic-ollama.test:11434", "minicpm-v4.6")
+    cfg.ai_roles = ProviderRoles(chat=settings, vision=settings)
+    return cfg
+
+
+@pytest.mark.parametrize("budget", [60, 120])
+@respx.mock
+def test_intent_uses_configured_chat_budget(tmp_path, monkeypatch, budget):
+    monkeypatch.setattr("assistant.images.time", SimpleNamespace(monotonic=lambda: 0))
+    client = VisionClient(intent_config(tmp_path, budget))
+    route = respx.post(client.chat_provider.settings.base_url + "/api/chat").respond(
+        200, json={"message": {"content": '{"kind":"search","query":"cables"}'}, "done": True},
+    )
+
+    async def scenario():
+        try:
+            assert (await client.intent("Find my cables")).kind == "search"
+        finally:
+            await client.aclose()
+
+    asyncio.run(scenario())
+    assert route.calls[0].request.extensions["timeout"] == dict.fromkeys(
+        ("connect", "read", "write", "pool"), budget,
+    )
+
+
+@pytest.mark.parametrize("first,repair,succeeds", [(30, 31, True), (50, 50, False)])
+@respx.mock
+def test_intent_queue_and_repair_share_configured_budget(tmp_path, monkeypatch, first, repair, succeeds):
+    clock, remaining = [0], []
+    monkeypatch.setattr("assistant.images.time", SimpleNamespace(monotonic=lambda: clock[0]))
+    client = VisionClient(intent_config(tmp_path, 120))
+    assert client.chat_provider is client.provider
+
+    def response(request):
+        timeout = request.extensions["timeout"]["read"]
+        remaining.append(timeout)
+        duration = first if len(remaining) == 1 else repair
+        if duration > timeout:
+            raise httpx.ReadTimeout("Synthetic remaining-budget failure", request=request)
+        clock[0] += duration
+        content = '{"kind":"search","unexpected":true}' if len(remaining) == 1 else '{"kind":"search","query":"cables"}'
+        return httpx.Response(200, json={"message": {"content": content}, "done": True})
+
+    route = respx.post(client.chat_provider.settings.base_url + "/api/chat").mock(side_effect=response)
+
+    async def scenario():
+        await client.lock.acquire()
+        task = asyncio.create_task(client.intent("Find my cables"))
+        try:
+            await asyncio.sleep(0)
+            assert not task.done() and not route.called
+            clock[0] += 30
+            client.lock.release()
+            if succeeds:
+                assert (await task).kind == "search"
+            else:
+                with pytest.raises(ServiceError) as error:
+                    await task
+                assert error.value.code == "model_unavailable"
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await client.aclose()
+
+    asyncio.run(scenario())
+    assert remaining == [90, 90 - first]
+    assert route.call_count == 2
+    assert clock[0] == (30 + first + repair if succeeds else 30 + first)
+
+
+@respx.mock
+def test_intent_configured_deadline_includes_resource_wait(tmp_path):
+    client = VisionClient(intent_config(tmp_path, .02))
+    route = respx.post(client.chat_provider.settings.base_url + "/api/chat").respond(
+        200, json={"message": {"content": '{"kind":"search"}'}, "done": True},
+    )
+
+    async def scenario():
+        await client.lock.acquire()
+        try:
+            with pytest.raises(ServiceError) as error:
+                await asyncio.wait_for(client.intent("Find my cables"), .2)
+            assert error.value.code == "model_unavailable"
+            assert not route.called
+        finally:
+            client.lock.release()
+            await client.aclose()
+
+    asyncio.run(scenario())
+
+
+@respx.mock
+def test_intent_obeys_elapsed_outer_deadline_and_releases_resource(tmp_path):
+    client = VisionClient(intent_config(tmp_path, 120))
+    cancelled, attempted = [], []
+
+    async def response(request):
+        attempted.append(request)
+        if not cancelled:
+            try:
+                await asyncio.sleep(1)
+            finally:
+                cancelled.append(True)
+        return httpx.Response(200, json={"message": {"content": '{"kind":"search","query":"cables"}'}, "done": True})
+
+    route = respx.post(client.chat_provider.settings.base_url + "/api/chat").mock(side_effect=response)
+
+    async def scenario():
+        try:
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(.03):
+                    await asyncio.sleep(.015)
+                    await client.intent("Find my cables")
+            assert cancelled == [True]
+            assert (await asyncio.wait_for(client.intent("Find my cables"), .2)).kind == "search"
+        finally:
+            await client.aclose()
+
+    asyncio.run(scenario())
+    assert len(attempted) == 2

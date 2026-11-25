@@ -148,7 +148,7 @@ export function useConversation(options: {
       if (turn) { turn.status = "sending"; turn.error = undefined; }
     }
     try {
-      const response = await options.api<ChatReply>("/chat", { method: "POST", body, signal: controller.signal, timeoutMs: 75_000 });
+      const response = await options.api<ChatReply>("/chat", { method: "POST", body, signal: controller.signal });
       if (!live(context, version)) return;
       accept(response, false, actionGeneration === options.actionGeneration?.());
       const turn = state.messages.find(item => item.id === body.clientTurnId);

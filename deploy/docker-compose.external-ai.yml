@@ -1,4 +1,5 @@
-# Deliberate API-only outbound access. Never enable this for normal local Ollama.
+# Deliberate API-only outbound access, including Ollama on the Docker host.
+# Not needed for the bundled internal http://ollama:11434 service.
 # Initialize the isolated provider-key directory even for an anonymous endpoint.
 # Provider/URL/model/key selection is resolved from the shared and role AI_* env.
 services:

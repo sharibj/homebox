@@ -151,4 +151,4 @@ class VisionClient:
             import json
             message = json.dumps({"context": context, "message": message}, ensure_ascii=False)
         return await self._generate(Intent, [{"role": "system", "content": instructions},
-                                            {"role": "user", "content": message}], None, 90, 600, self.chat_provider)
+                                            {"role": "user", "content": message}], None, self.config.chat_timeout, 600, self.chat_provider)

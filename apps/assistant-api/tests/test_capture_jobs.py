@@ -12,6 +12,8 @@ import respx
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from process_helpers import hold_model_lock, process_state, start_ready_processes, stop_processes, wait_for_process_signal
+
 from assistant.capture_jobs import CaptureJobs, MODEL_LOCK, draft_result
 from assistant.clients import ServiceError
 from assistant.config import Config
@@ -205,40 +207,33 @@ def test_recovery_rereads_after_lock_without_clobbering_finished_job(standalone,
     assert manager.load(session, row["id"])["status"] == "succeeded" and calls == []
 
 
-def _hold_model_lock(path, instance, acquired, release):
-    import fcntl
-    from pathlib import Path
-    state = State(Path(path), instance)
-    with (state.locks / MODEL_LOCK).open("a") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        acquired.set()
-        release.wait(10)
-
-
 def test_live_worker_lock_and_crash_release_across_processes(standalone):
     import multiprocessing
+    import signal
     manager, session, calls = standalone
     row = manager.submit(session, "worker-crash-key", photo(), "", None)
     manager.state.execute("UPDATE capture_jobs SET status='running' WHERE id=?", (row["id"],))
     context = multiprocessing.get_context("spawn")
-    acquired, release = context.Event(), context.Event()
-    process = context.Process(target=_hold_model_lock,
-                              args=(str(manager.cfg.state), manager.cfg.instance_id, acquired, release))
+    ready, start, acquired, release = [context.Semaphore(0) for _ in range(4)]
+    process = context.Process(target=hold_model_lock,
+                              args=(str(manager.state.locks), MODEL_LOCK, ready, start, acquired, release))
     try:
-        process.start()
-        assert acquired.wait(4)
+        start_ready_processes(((process, ready),))
+        start.release()
+        wait_for_process_signal(process, acquired, 4, "model lock acquisition")
         assert asyncio.run(manager.step()) is False
         assert manager.load(session, row["id"])["status"] == "running"
+        assert process.is_alive(), process_state(process)
         process.terminate()
         process.join(4)
+        assert process.exitcode == -signal.SIGTERM, process_state(process)
         asyncio.run(manager.step())
         recovered = manager.public(manager.load(session, row["id"]))
         assert recovered["status"] == "manual" and recovered["warningCodes"] == ["analysis_interrupted"]
         assert calls == []
     finally:
-        if process.is_alive():
-            process.terminate()
-        process.join(4)
+        release.release()
+        stop_processes((process,), timeout=4)
 
 
 def test_total_running_deadline_cancels_and_retains_manual_photo(standalone):

@@ -12,6 +12,11 @@ import respx
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from process_helpers import (
+    hold_collection_lock, join_clean_processes, process_state, start_ready_processes, stop_processes,
+    wait_for_process_signal,
+)
+
 from assistant.clients import ServiceError
 from assistant.config import Config
 from assistant.images import VisionClient, normalize
@@ -443,43 +448,50 @@ def test_startup_rechecks_success_committed_before_nonblocking_lock(setup, monke
     assert final["result"]["id"] == "latest-record"
 
 
-def _hold_collection_lock(path, instance, collection, acquired, release):
-    from pathlib import Path
-    store = State(Path(path), instance)
-    async def run():
-        async with store.collection_lock(collection):
-            acquired.set()
-            await asyncio.to_thread(release.wait, 5)
-    asyncio.run(run())
-
-
 def test_collection_lock_serializes_separate_processes(setup):
     import multiprocessing
     _, app, _, _ = setup
     context = multiprocessing.get_context("spawn")
-    first_in, second_in, release1, release2 = [context.Event() for _ in range(4)]
+    ready1, ready2, start1, start2, first_in, second_in, release1, release2, contended = [
+        context.Semaphore(0) for _ in range(9)
+    ]
     args = (str(app.state.config.state), app.state.config.instance_id, G1)
-    first = context.Process(target=_hold_collection_lock, args=(*args, first_in, release1))
-    second = context.Process(target=_hold_collection_lock, args=(*args, second_in, release2))
+    first = context.Process(target=hold_collection_lock, args=(*args, ready1, start1, first_in, release1))
+    second = context.Process(target=hold_collection_lock,
+                             args=(*args, ready2, start2, second_in, release2, contended))
     try:
-        first.start()
-        assert first_in.wait(3)
-        second.start()
-        assert not second_in.wait(.15)
-        release1.set()
-        assert second_in.wait(3)
-        release2.set()
-        first.join(3)
-        second.join(3)
-        assert first.exitcode == second.exitcode == 0
+        start_ready_processes(((first, ready1), (second, ready2)))
+        start1.release()
+        wait_for_process_signal(first, first_in, 3, "first collection lock acquisition")
+        start2.release()
+        wait_for_process_signal(second, contended, 3, "second collection lock contention")
+        assert first.is_alive(), process_state(first)
+        assert not second_in.acquire(block=False), "Second process entered while the first still held the lock"
+        release1.release()
+        wait_for_process_signal(second, second_in, 3, "second collection lock acquisition after release")
+        release2.release()
+        join_clean_processes((first, second))
     finally:
-        release1.set()
-        release2.set()
-        for process in (first, second):
-            if process.is_alive():
-                process.terminate()
-            if process.pid:
-                process.join(3)
+        release1.release()
+        release2.release()
+        stop_processes((first, second))
+
+
+def test_process_bootstrap_failure_reports_exit_code(tmp_path):
+    import multiprocessing
+    context = multiprocessing.get_context("spawn")
+    invalid_parent = tmp_path / "not-a-directory"
+    invalid_parent.write_text("synthetic bootstrap failure")
+    ready, start, acquired, release = [context.Semaphore(0) for _ in range(4)]
+    process = context.Process(target=hold_collection_lock,
+                              args=(str(invalid_parent / "state.db"), "test-instance", G1,
+                                    ready, start, acquired, release))
+    try:
+        with pytest.raises(AssertionError, match=r"bootstrap: child exited before signaling; .*exitcode=1"):
+            start_ready_processes(((process, ready),))
+        assert not ready.acquire(block=False) and not acquired.acquire(block=False)
+    finally:
+        stop_processes((process,))
 
 
 @respx.mock

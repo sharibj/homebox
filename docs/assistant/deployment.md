@@ -195,6 +195,57 @@ Leave shared overrides blank unless you intend them to apply. If both roles use 
 
 `openai-compatible` means Chat Completions. `anthropic-messages` selects native Anthropic Messages; `gemini` selects Google's native Gemini `generateContent` protocol, not an OpenAI-compatible shim. Changing a provider label does not translate an incompatible endpoint. The vision role must support images. URLs must not contain credentials or keys. Choosing an external service sends that role's submitted images/prompts to it; review privacy, retention and cost before opting in.
 
+### Host Ollama with `minicpm-v4.6` for chat and vision
+
+This opt-in profile uses native Ollama for both chat and image recognition. It does not select a cloud provider or change the bundled Ollama default. The exact model name is `minicpm-v4.6`; the host Ollama server must already support and have that model.
+
+Use the settings fragment in `deploy/examples/ollama-minicpm-host.env`. **Replace** the matching keys in protected `deploy/.env`; do not append duplicate keys, replace the complete file, or use this fragment alone as `--env-file`. Preserve the instance ID, secrets, hostnames and LAN settings. The example URLs below are for Docker Desktop; native Linux requires both URL replacements described below:
+
+```dotenv
+AI_CHAT_PROVIDER=ollama
+AI_CHAT_BASE_URL=http://host.docker.internal:11434
+AI_CHAT_MODEL=minicpm-v4.6
+AI_VISION_PROVIDER=ollama
+AI_VISION_BASE_URL=http://host.docker.internal:11434
+AI_VISION_MODEL=minicpm-v4.6
+AI_API_KEY_FILE=
+AI_CHAT_API_KEY_FILE=
+AI_VISION_API_KEY_FILE=
+ASSISTANT_CHAT_TURN_TIMEOUT_SECONDS=120
+```
+
+Set **both roles explicitly**, even when shared settings select another provider. Old explicit role settings override shared settings. Clear all three key-file selections for anonymous host Ollama: an old explicit role key would otherwise be sent to that endpoint. This clears configuration references only; keep existing key files for a deliberate return to their provider.
+
+Inside the API container, `localhost:11434` means the API container, not the host. Docker Desktop provides `host.docker.internal` for host access. The stock external-AI override adds no host alias or `extra_hosts` mapping, preserving existing cloud and host-gateway configurations. On native Linux Docker Engine, do not assume that alias exists. **Replace both role base URLs with the same already container-reachable numeric private host URL.** For example, only if the actual Ollama server is already reachable at that address:
+
+```dotenv
+# Synthetic private-IP example, not a discovered address or connectivity test.
+AI_CHAT_BASE_URL=http://192.168.50.1:11434
+AI_VISION_BASE_URL=http://192.168.50.1:11434
+```
+
+**Native-Linux host Ollama bound only to `127.0.0.1` is NOT READY for this profile.** A bridge or gateway address cannot reach a loopback-only listener. Stop for a separately approved network design instead of changing the host listener. A successful host request to `localhost:11434` proves host access only, on either platform. No actual Linux container-to-host connectivity has been tested for this profile. It changes no host listener, proxy, firewall, host networking or published port. Do not use public Ollama exposure or a `0.0.0.0` listener as a workaround.
+
+The bundled `http://ollama:11434` service is a different server, with weights in the `ollama_data` volume. Pulling a model there does not install it in host Ollama. The lifecycle utility's model status/pull commands manage this bundled cache only, not the host server. Use host Ollama to manage the already-installed `minicpm-v4.6` model. The bundled service's 8 GiB/four-CPU cap and loaded-model setting do not control the host process. Keep the bundled cache; do not use the model-pull override to populate the host cache. This profile requires no download, warmup or inference during configuration.
+
+The host endpoint needs the existing **external-AI override**, despite using the `ollama` provider. That override grants outbound access only to the API and mounts the provider-key directory read-only. Prepare the directory with `sh deploy/scripts/init-ai-secret.sh` without arguments; no key is needed and no key file is created. See [Provider keys and outbound access](#provider-keys-and-outbound-access) for the explicit API recreation step. Every selected Compose command must include the base and external-AI files. Include the LAN file as well only if LAN access is already selected.
+
+For configuration validation only, choose the command matching the existing deployment:
+
+```sh
+# Without the LAN override:
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.external-ai.yml config --quiet
+# Existing LAN deployment instead:
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.external-ai.yml \
+  -f deploy/docker-compose.lan.yml config --quiet
+```
+
+These commands do not recreate containers, contact Ollama, or prove host reachability. Source changes to chat timeout handling also require the matching rebuilt API and PWA images; changing `.env` does not update older callers.
+
+The profile raises only the chat turn budget from its unchanged 60-second default to the supported maximum of 120 seconds. That is one budget for the **whole turn**, including lock waits, model calls, repair, inventory reads and state processing. A roughly 58-second direct model request does not establish enough time for a whole turn, concurrent work or retries. Some slow or queued turns can still time out. Durable photo jobs retain their separate 120-second queue and 900-second running defaults; older synchronous photo clients retain a 90-second budget. This profile promises neither accuracy nor latency on a particular host. Measure the real model, first calls, largest supported images and concurrent use separately.
+
 ### Native Gemini with a free-tier image-capable model
 
 Use `gemini-3.1-flash-lite` for lightweight text and image recognition. Google's [model page](https://aistudio.google.com/docs/models/gemini-3.1-flash-lite) lists image input, text output, structured JSON output, and free-tier input/output pricing, checked on November 23, 2026. It recognizes images; it does not generate them. Google does not publish parameter counts, so “smallest” here means the lightweight Flash-Lite option, not a verified parameter-size ranking.
@@ -271,7 +322,7 @@ dce up -d --no-deps --no-build --pull never --force-recreate \
   --wait --wait-timeout 180 assistant-api
 ```
 
-This override forces no provider, URL or model. The API validates the resolved roles. It adds no host port and changes no Homebox/MCP/PWA egress. The normal local Ollama stack does not mount the provider directory or require a fourth secret. Do not put key contents in `.env`, browser settings, build arguments, logs or chat.
+This override forces no provider, URL or model. The API validates the resolved roles. It adds no host port and changes no Homebox/MCP/PWA egress. The bundled internal Ollama stack does not mount the provider directory or require a fourth secret. Host Ollama uses the override but needs no key for an anonymous endpoint. Do not put key contents in `.env`, browser settings, build arguments, logs or chat.
 
 Compose reads `--env-file` when creating a container. Editing `.env` does not update a running process, and `restart` retains the container's old environment. Configuration-only changes need no build; recreate only the API with the same selected override files. `--force-recreate` also reloads a changed key when its path is unchanged. `config --quiet` checks Compose wiring, not semantic provider validity; an unsupported kind or unreadable key can still fail API startup.
 
@@ -327,6 +378,15 @@ docker build --check -f deploy/Dockerfile.homebox .
 ```
 
 The proxy test uses real Caddy/TLS and disposable private fixtures. The backup test uses generated files and verifies private ownership, all secrets, configuration, CA state, and stop/resume behavior. Neither test accesses existing inventory.
+
+Check the host MiniCPM fragment, default Ollama, Haiku, and existing mixed/cloud profiles with an API image built from the source under test:
+
+```sh
+ASSISTANT_TEST_IMAGE=homebox-inventory-assistant:your-tested-source-tag \
+  sh deploy/tests/check-ollama-config.sh
+```
+
+This check renders ten disposable environments from public files, including the original nine profiles and a synthetic native-Linux numeric-URL case. It tests the real role resolver and `Config.load`, anonymous key selection after replacing old Haiku settings, the 120-second chat limit, absence of added host mappings, optional LAN wiring, and existing cloud validators. Test containers have no network or production mounts. It does not read protected `deploy/.env`, start the stack, pull weights, or test host connectivity or inference.
 
 ## Disposable browser acceptance
 
