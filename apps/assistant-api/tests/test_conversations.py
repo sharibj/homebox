@@ -12,26 +12,17 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
+from process_helpers import (
+    STARTUP_TIMEOUT, initial_conversation_turn, join_clean_processes,
+    receive_process_messages, stop_processes,
+)
+
 from assistant.clients import ServiceError
 from assistant.main import PREFIX
 from assistant.schemas import Intent, Message
 from assistant.conversations import exhaustive_page
-from test_api import FakeClients, G1, G2, confirm, setup
+from test_api import G1, G2, confirm, setup
 from test_capture_jobs import photo
-
-
-def process_initial_turn(cfg, session, items, body, output):
-    from assistant.actions import Actions
-    from assistant.conversations import Conversations
-    from assistant.state import State
-    store, fake = State(cfg.state, cfg.instance_id), FakeClients()
-    fake.items = items
-    fake.memberships["Bearer alice"] = [session["collection"]]
-    service = Conversations(cfg, store, fake, Actions(cfg, store, fake), None)
-    try:
-        output.put(("ok", asyncio.run(service.handle(session, Message(**body)))))
-    except Exception as exc:
-        output.put(("error", type(exc).__name__))
 
 
 def turn(client, text=None, previous=None, **fields):
@@ -457,23 +448,125 @@ def test_whole_turn_timeout_includes_inventory_wait_and_does_not_repeat(setup, m
 
 def test_initial_idempotency_serializes_across_os_processes(setup):
     _, app, fake, _ = setup
-    fake.add("Entry", location=True)
+    destination = fake.add("Entry", location=True)
     session = scoped_session(app)
+
+    async def inventory_fixture():
+        requests = [("list_destinations_page", {"kind": kind, "query": "Entry", "page": 1, "page_size": 20})
+                    for kind in ("locations", "items")]
+        requests.append(("get_entity_cards", {"entity_ids": [destination]}))
+        groups = await fake.homebox("GET", "/groups/all", session)
+        return {"groups": [group for group in groups if group["id"] == session["collection"]],
+                "tools": [(name, arguments, await fake.tool(session, name, arguments))
+                          for name, arguments in requests]}
+
+    inventory = asyncio.run(inventory_fixture())
     ctx = multiprocessing.get_context("spawn")
-    output = ctx.Queue()
+    channels = [ctx.Pipe(duplex=False) for _ in range(3)]
+    starts = [ctx.Semaphore(0) for _ in channels]
+    release = ctx.Semaphore(0)
     body = {"message":"Add a cable to Entry","clientTurnId":str(uuid4())}
-    processes = [ctx.Process(target=process_initial_turn,
-        args=(app.state.config, session, fake.items, body, output)) for _ in range(3)]
-    for process in processes:
-        process.start()
-    values = [output.get(timeout=20) for _ in processes]
-    for process in processes:
-        process.join(timeout=10)
-        assert process.exitcode == 0
-    assert all(status == "ok" for status, _ in values), values
-    assert all(value == values[0][1] for _, value in values)
+    startup_timeout = STARTUP_TIMEOUT * len(channels)
+    processes = [ctx.Process(target=initial_conversation_turn,
+        args=(app.state.config, session, inventory, body, start, release, sender, index == 0, startup_timeout))
+        for index, ((_, sender), start) in enumerate(zip(channels, starts))]
+    workers = list(zip(processes, (receiver for receiver, _ in channels)))
+    try:
+        # Three full conversation services have more cold-import work than the
+        # lightweight lock holders. This is one shared, bounded startup budget.
+        startup_deadline = time.monotonic() + startup_timeout
+        for process, (_, sender) in zip(processes, channels):
+            process.start()
+            sender.close()
+        receive_process_messages(workers, "ready", startup_deadline, "initial turn bootstrap")
+        # One budget starts only after all three services are ready. It covers
+        # actual chat work plus bounded IPC/process-exit headroom, not imports.
+        deadline = time.monotonic() + app.state.config.chat_timeout + 15
+        starts[0].release()
+        receive_process_messages(workers[:1], "entered", deadline, "first initial turn session lock")
+        for start in starts[1:]:
+            start.release()
+        # Both followers must hit the kernel flock held by the first request.
+        receive_process_messages(workers[1:], "contended", deadline, "concurrent initial turn contention")
+        release.release()
+        values = receive_process_messages(workers, "result", deadline, "initial turn results")
+        join_clean_processes(processes, timeout=max(0, deadline - time.monotonic()))
+    finally:
+        release.release()
+        try:
+            stop_processes(processes)
+        finally:
+            for receiver, sender in channels:
+                receiver.close()
+                sender.close()
+    assert all(value["value"] == values[0]["value"] for value in values)
+    assert values[0]["value"]["action"]["status"] == "proposed"
+    assert sum(value["calls"].get("create_item", 0) for value in values) == 0
+    assert sum(value["calls"].get("list_destinations_page", 0) for value in values) == 2
+    assert sum(value["calls"].get("get_entity_cards", 0) for value in values) == 1
     assert app.state.store.one("SELECT count(*) AS n FROM actions")["n"] == 1
     assert app.state.store.one("SELECT count(*) AS n FROM conversations")["n"] == 1
+    assert app.state.store.one("SELECT count(*) AS n FROM chat_initial_keys")["n"] == 1
+    assert app.state.store.one("SELECT count(*) AS n FROM chat_turns")["n"] == 1
+
+
+@pytest.mark.parametrize("failure_phase,error", [("bootstrap", "FileExistsError"), ("request", "ValidationError")])
+def test_initial_turn_worker_reports_phase_and_traceback(setup, tmp_path, failure_phase, error):
+    _, app, fake, _ = setup
+    cfg = app.state.config
+    session = scoped_session(app)
+    body = {"message": {"invalid": "synthetic request"}}
+    if failure_phase == "bootstrap":
+        invalid_parent = tmp_path / "not-a-directory"
+        invalid_parent.write_text("synthetic bootstrap failure")
+        cfg = replace(cfg, state=invalid_parent / "state.db")
+    ctx = multiprocessing.get_context("spawn")
+    receiver, sender = ctx.Pipe(duplex=False)
+    start, release = ctx.Semaphore(0), ctx.Semaphore(0)
+    process = ctx.Process(target=initial_conversation_turn,
+        args=(cfg, session, {"groups": [], "tools": []}, body, start, release, sender, False))
+    workers = [(process, receiver)]
+    try:
+        process.start()
+        sender.close()
+        deadline = time.monotonic() + STARTUP_TIMEOUT
+        if failure_phase == "request":
+            receive_process_messages(workers, "ready", deadline, "diagnostic bootstrap")
+            start.release()
+        with pytest.raises(AssertionError) as failure:
+            receive_process_messages(workers, "result", deadline, "diagnostic worker failure")
+        details = str(failure.value)
+        assert f"'phase': '{failure_phase}'" in details and error in details
+        assert "Traceback (most recent call last)" in details and f"pid={process.pid}" in details
+        process.join(timeout=15)
+        assert process.exitcode == 1
+    finally:
+        try:
+            stop_processes((process,))
+        finally:
+            receiver.close()
+            sender.close()
+
+
+def test_initial_turn_pipe_reports_abrupt_child_exit():
+    import os
+    ctx = multiprocessing.get_context("spawn")
+    receiver, sender = ctx.Pipe(duplex=False)
+    process = ctx.Process(target=os._exit, args=(7,))
+    try:
+        process.start()
+        sender.close()
+        process.join(timeout=STARTUP_TIMEOUT)
+        assert process.exitcode == 7
+        with pytest.raises(AssertionError, match=r"abrupt bootstrap: .*pid=.*exitcode=7"):
+            receive_process_messages([(process, receiver)], "ready",
+                                     time.monotonic() + 1, "abrupt bootstrap")
+    finally:
+        try:
+            stop_processes((process,))
+        finally:
+            receiver.close()
+            sender.close()
 
 
 def test_running_confirmation_wins_race_without_replacement_proposal(setup):
