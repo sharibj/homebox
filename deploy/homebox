@@ -1,0 +1,454 @@
+#!/bin/sh
+# One operator entrypoint. Structured state lives in an isolated Python container.
+set -eu
+umask 077
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+DEPLOY=$ROOT/deploy
+PYTHON=python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
+PROJECT=homebox-inventory
+STATE=
+YES=0
+RESUME=0
+TEST_OVERRIDE=${HOMEBOX_LIFECYCLE_TEST_OVERRIDE:-}
+usage() {
+  printf '%s\n' \
+    'Usage: deploy/homebox [--project NAME] [--state-dir ABSOLUTE] [--yes] COMMAND' \
+    '  fresh [--resume]       Build/start a new local installation, registration closed' \
+    '  redeploy               Build local sources; preserve data, accounts and settings' \
+    '  adopt                  Explicitly bind a validated existing stack to this state directory' \
+    '  status                 Show service health and separate AI setup status' \
+    '  backup                 Drain safely and retain a consistent private snapshot' \
+    '  models status|pull --confirm-download  Explicit local Ollama model setup' \
+    '  users bootstrap        Explicit first-owner bootstrap for a fresh managed install' \
+    '  users collections|members|invite|accept-invite|remove-member [OPTIONS]' \
+    '  users restore-registration  Recover the exact prior flag after interruption' \
+    'See docs/assistant/local-lifecycle.md. No model download or CA trust is automatic.'
+}
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --project) PROJECT=${2:?Missing project}; shift 2 ;;
+    --state-dir) STATE=${2:?Missing state directory}; shift 2 ;;
+    --yes) YES=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) break ;;
+  esac
+done
+COMMAND=${1:-status}
+[ "$#" -eq 0 ] || shift
+REGISTRATION_RECOVERY=0
+if [ "$COMMAND" = users ] && [ "${1:-}" = restore-registration ]; then REGISTRATION_RECOVERY=1; fi
+MODEL_RECOVERY=0
+if [ "$COMMAND" = models ] && [ "${1:-}" = restore-network ]; then MODEL_RECOVERY=1; fi
+case "$PROJECT" in ""|*[!a-z0-9_-]*|[-_]*) echo "Invalid Compose project." >&2; exit 2 ;; esac
+if ! command -v docker >/dev/null 2>&1; then
+  if [ -x /Applications/Docker.app/Contents/Resources/bin/docker ]; then
+    PATH=/Applications/Docker.app/Contents/Resources/bin:$PATH
+    export PATH
+  else echo "Docker CLI with Compose is required." >&2; exit 2; fi
+fi
+# Also make Docker Desktop's existing credential helper discoverable.
+if [ -d /Applications/Docker.app/Contents/Resources/bin ]; then
+  PATH=/Applications/Docker.app/Contents/Resources/bin:$PATH; export PATH
+fi
+clear_compose_controls() {
+  for key in $(env | while IFS='=' read -r name ignored; do
+    case "$name" in COMPOSE_*)
+      case "$name" in *[!A-Za-z0-9_]*) ;; *) printf '%s\n' "$name" ;; esac ;;
+    esac
+  done); do unset "$key"; done
+}
+clear_compose_controls
+docker compose version >/dev/null
+engine=$(docker info --format '{{.ID}}|{{.OperatingSystem}}')
+DAEMON=${engine%%|*}
+ENGINE_OS=${engine#*|}
+[ -n "$DAEMON" ] || { echo "Docker is not ready." >&2; exit 2; }
+STATE=${STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/homebox/$PROJECT}
+STATE=${STATE%/}
+case "$STATE" in /*) ;; *) echo "--state-dir must be absolute." >&2; exit 2 ;; esac
+case "$STATE" in
+  /|"$HOME"|"$ROOT"|"$ROOT"/*|*/../*|*/..|*/./*|*//*)
+    echo "Use a dedicated private state directory outside the checkout, not a home/system/data directory." >&2; exit 2 ;;
+esac
+case "$STATE:$ROOT" in *'|'*|*'
+'*) echo "Paths must not contain newlines or |." >&2; exit 2 ;; esac
+ancestor=$STATE
+while [ "$ancestor" != / ]; do
+  [ ! -L "$ancestor" ] || { echo "Refusing symlink state-directory ancestry." >&2; exit 2; }
+  ancestor=$(dirname -- "$ancestor")
+done
+if [ -e "$STATE" ]; then
+  [ -d "$STATE" ] || { echo "State must be a directory." >&2; exit 2; }
+  case "$(uname -s)" in
+    Darwin) mode=$(stat -f '%Lp' "$STATE"); owner=$(stat -f '%u' "$STATE") ;;
+    *) mode=$(stat -c '%a' "$STATE"); owner=$(stat -c '%u' "$STATE") ;;
+  esac
+  [ "$mode" = 700 ] && [ "$owner" = "$(id -u)" ] || {
+    echo "Existing state directory must be owned by this operator and mode 0700; it was not changed." >&2; exit 2;
+  }
+else
+  mkdir -p "$STATE"
+  chmod 700 "$STATE"
+fi
+STATE=$(CDPATH= cd -- "$STATE" && pwd -P)
+[ ! -L "$STATE/work" ] || { echo "Refusing a symlink work directory." >&2; exit 2; }
+mkdir -p "$STATE/work"
+chmod 700 "$STATE/work"
+case "$TEST_OVERRIDE" in
+  "") ;;
+  /*)
+    case "$PROJECT" in homebox-lifecycle-test-*) ;; *) echo "Test override requires an isolated test project." >&2; exit 2 ;; esac ;;
+  *) echo "Test override must be absolute." >&2; exit 2 ;;
+esac
+case "$COMMAND" in
+  fresh|redeploy|adopt|backup|users|models) ;;
+  status) ;;
+  *) usage >&2; exit 2 ;;
+esac
+if [ "$COMMAND" = fresh ] && [ "${1:-}" = --resume ]; then RESUME=1; shift; fi
+LOCKED=0
+INSTALL_LOCK=$DEPLOY/.homebox-operation.lock
+PROXY_STOPPED=0
+CUTOVER=0
+OK=0
+BOOTSTRAP=0
+MODEL_DOWNLOAD=0
+cleanup() {
+  result=$?
+  trap - EXIT HUP INT TERM
+  if [ "$MODEL_DOWNLOAD" = 1 ]; then
+    dce up -d --no-deps --no-build --pull never --wait --wait-timeout 180 ollama &&
+      meta model-download-end || result=1
+  fi
+  if [ "$BOOTSTRAP" = 1 ]; then
+    meta bootstrap-restore &&
+      dce up -d --no-deps --no-build --pull never --wait --wait-timeout 180 homebox &&
+      verify_registration &&
+      meta bootstrap-restored || result=1
+  fi
+  if [ "$result" -ne 0 ] && [ "$CUTOVER" = 1 ]; then
+    dce stop --timeout -1 proxy || result=1
+  fi
+  if [ "$PROXY_STOPPED" = 1 ] && [ "$CUTOVER" = 0 ]; then
+    dce up -d --no-deps --no-recreate --no-build --pull never \
+      --wait --wait-timeout 180 proxy || result=1
+  fi
+  if [ "$result" -ne 0 ]; then
+    echo "Stopped safely. Private recovery journal: $STATE/installation.json" >&2
+    if [ "$CUTOVER" = 1 ]; then
+      echo "Ingress remains closed. Do not restore data or downgrade a migrated database automatically." >&2
+    fi
+  fi
+  if [ "$LOCKED" = 1 ]; then
+    rm -f "$INSTALL_LOCK/pid"
+    rmdir "$INSTALL_LOCK"
+  fi
+  exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+if [ "$LOCKED" = 0 ]; then
+  mkdir "$INSTALL_LOCK" 2>/dev/null || {
+    echo "Another operation holds the shared installation lock. Review it before removing its lock." >&2; exit 2;
+  }
+  LOCKED=1
+  printf '%s\n' "$$" >"$INSTALL_LOCK/pid"
+fi
+meta() {
+  set -- "$PYTHON" python -B /source/deploy/lifecycle/metadata.py "$@"
+  [ -z "$TEST_OVERRIDE" ] || set -- --mount \
+    "type=bind,source=$TEST_OVERRIDE,target=/selected-compose-override.yml,readonly" "$@"
+  docker run --rm -i --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges:true --user "$(id -u):$(id -g)" \
+    -e "LC_ROOT=$ROOT" -e "LC_STATE=$STATE" -e "LC_PROJECT=$PROJECT" \
+    -e "LC_DAEMON=$DAEMON" -e "LC_COMMAND=$COMMAND" -e "LC_RESUME=$RESUME" \
+    -e "LC_ENGINE_OS=$ENGINE_OS" \
+    -e "LC_REGISTRATION_RECOVERY=$REGISTRATION_RECOVERY" \
+    -e "LC_MODEL_RECOVERY=$MODEL_RECOVERY" \
+    -e "LC_TEST_OVERRIDE=$TEST_OVERRIDE" \
+    --mount "type=bind,source=$ROOT,target=/source,readonly" \
+    --mount "type=bind,source=$DEPLOY,target=/deployment" \
+    --mount "type=bind,source=$STATE,target=/state" \
+    "$@"
+}
+capture() {
+  ids=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
+  if [ -n "$ids" ]; then
+    # Docker returns hexadecimal IDs only.
+    docker inspect $ids >"$STATE/work/inspect.json"
+  else printf '[]\n' >"$STATE/work/inspect.json"; fi
+  docker volume ls --filter "label=com.docker.compose.project=$PROJECT" \
+    --format '{{.Name}}' >"$STATE/work/volumes.txt"
+  docker volume ls --filter "name=^${PROJECT}_" --format '{{.Name}}' >>"$STATE/work/volumes.txt"
+  volume_names=$(sort -u "$STATE/work/volumes.txt")
+  if [ -n "$volume_names" ]; then
+    docker volume inspect $volume_names >"$STATE/work/volume-inspect.json"
+  else printf '[]\n' >"$STATE/work/volume-inspect.json"; fi
+}
+capture
+meta select
+IFS= read -r EXTERNAL <"$STATE/work/external"
+IFS= read -r LAN <"$STATE/work/lan"
+dce() {
+  [ -z "$TEST_OVERRIDE" ] || set -- -f "$TEST_OVERRIDE" "$@"
+  [ "$LAN" = 0 ] || set -- -f "$DEPLOY/docker-compose.lan.yml" "$@"
+  [ "$EXTERNAL" = 0 ] || set -- -f "$DEPLOY/docker-compose.external-ai.yml" "$@"
+  set -- -f "$DEPLOY/docker-compose.yml" "$@"
+  docker compose -p "$PROJECT" --env-file "$DEPLOY/.env" "$@"
+}
+verify_registration() {
+  registration_container=$(dce ps -q homebox)
+  [ -n "$registration_container" ] || { echo "Native Homebox is not running; recovery remains pending." >&2; return 1; }
+  docker inspect "$registration_container" >"$STATE/work/registration-container.json"
+  docker run --rm --network "container:$registration_container" --read-only --cap-drop ALL \
+    --security-opt no-new-privileges:true --user "$(id -u):$(id -g)" \
+    --mount "type=bind,source=$ROOT/deploy/lifecycle,target=/lifecycle,readonly" \
+    --mount "type=bind,source=$DEPLOY,target=/deployment,readonly" \
+    --mount "type=bind,source=$STATE,target=/state" \
+    "$PYTHON" python -B /lifecycle/metadata.py bootstrap-verify
+}
+confirm() {
+  [ "$YES" = 1 ] && return
+  [ -t 0 ] || { echo "Review the operation, then use --yes for noninteractive execution." >&2; exit 2; }
+  printf '%s [type yes]: ' "$1"
+  IFS= read -r answer
+  [ "$answer" = yes ] || { echo "Canceled." >&2; exit 2; }
+}
+sanitize_config_environment() {
+  meta env-keys >"$STATE/work/env-keys.txt"
+  while IFS= read -r key; do unset "$key"; done <"$STATE/work/env-keys.txt"
+  clear_compose_controls
+}
+# Clear optional defaults too, before initializers or any Compose dispatch.
+sanitize_config_environment
+if [ "$COMMAND" = fresh ]; then
+  confirm "Create or resume this new local installation (no signup/model download/CA trust)?"
+  meta init-stage
+  IFS= read -r SKIP_INIT <"$STATE/work/skip-init"
+  if [ "$SKIP_INIT" = 0 ]; then
+    HOMEBOX_DEPLOY_DIR="$STATE/bootstrap" sh "$DEPLOY/scripts/init-config.sh"
+    HOMEBOX_DEPLOY_DIR="$STATE/bootstrap" sh "$DEPLOY/scripts/init-secrets.sh"
+    meta init-install
+  fi
+fi
+# The protected file, not ambient shell variables, is the configuration authority.
+if [ "$REGISTRATION_RECOVERY" = 1 ]; then meta bootstrap-restore; fi
+sanitize_config_environment
+dce config --quiet
+dce config --format json >"$STATE/work/config.json"
+meta config
+if [ "$REGISTRATION_RECOVERY" = 1 ]; then
+  IFS= read -r registration_image <"$STATE/work/registration-image.txt"
+  docker image inspect "$registration_image" >"$STATE/work/registration-image.json"
+  meta bootstrap-image
+  dce up -d --no-deps --no-build --pull never --wait --wait-timeout 180 homebox
+  verify_registration
+  meta bootstrap-restored
+  echo "Verified the exact pre-bootstrap native registration state. No account was created."
+  exit 0
+fi
+if [ "$COMMAND" = adopt ]; then
+  confirm "Bind this validated existing stack to this canonical state directory (no container/data change)?"
+  meta adopt
+  echo "Existing stack validated and bound. Use this same project/state directory for redeploy."
+  exit 0
+fi
+model_status() {
+  printf '' >"$STATE/work/model-list.txt"
+  model_container=$(dce ps -q ollama)
+  if [ -n "$model_container" ]; then
+    docker exec "$model_container" ollama list >"$STATE/work/model-list.txt" 2>/dev/null || true
+  fi
+  meta status
+}
+if [ "$COMMAND" = status ]; then
+  dce ps
+  model_status
+  exit 0
+fi
+if [ "$COMMAND" = models ]; then
+  action=${1:-status}; [ "$#" -eq 0 ] || shift
+  case "$action" in
+    status) model_status; exit 0 ;;
+    restore-network)
+      dce up -d --no-deps --no-build --pull never --wait --wait-timeout 180 ollama
+      meta model-download-end
+      echo "Restored Ollama's normal network without pulling or running a model."
+      exit 0 ;;
+    pull)
+      [ "${1:-}" = --confirm-download ] || {
+        echo "Use models pull --confirm-download after reviewing disk, bandwidth and runtime resources." >&2; exit 2;
+      }
+      meta model-plan
+      meta model-download-begin
+      MODEL_DOWNLOAD=1
+      dce -f "$DEPLOY/docker-compose.model-pull.yml" up -d --no-deps --no-build --pull never \
+        --wait --wait-timeout 180 ollama
+      while IFS= read -r model; do dce exec -T ollama ollama pull "$model"; done <"$STATE/work/models.txt"
+      dce up -d --no-deps --no-build --pull never --wait --wait-timeout 180 ollama
+      MODEL_DOWNLOAD=0
+      meta model-download-end
+      model_status
+      exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+fi
+if [ "$COMMAND" = users ]; then
+  action=${1:-}; [ "$#" -eq 0 ] || shift
+  case "$action" in
+    bootstrap|collections|members|invite|accept-invite|remove-member) ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  hb=$(dce ps -q homebox)
+  [ -n "$hb" ] || { echo "Homebox is not running." >&2; exit 2; }
+  if [ "$action" = bootstrap ]; then
+    confirm "Temporarily enable PUBLIC registration for the first owner, then restore it (brief Homebox-only downtime)?"
+    meta bootstrap-begin
+    BOOTSTRAP=1
+    dce up -d --no-deps --no-build --pull never --wait --wait-timeout 180 homebox
+    hb=$(dce ps -q homebox)
+  fi
+  # An explicit protected credentials file is optional; otherwise use a TTY.
+  tty_flags=-i
+  [ ! -t 0 ] || tty_flags=-it
+  user_result=0
+  docker run --rm "$tty_flags" --network "container:$hb" --read-only --cap-drop ALL \
+    --security-opt no-new-privileges:true --user "$(id -u):$(id -g)" \
+    --mount "type=bind,source=$ROOT,target=/source,readonly" \
+    --mount "type=bind,source=$STATE,target=/state" \
+    "$PYTHON" python -B /source/deploy/lifecycle/accounts.py "$action" "$@" || user_result=$?
+  if [ "$action" = bootstrap ]; then
+    meta bootstrap-restore
+    dce up -d --no-deps --no-build --pull never --wait --wait-timeout 180 homebox
+    verify_registration
+    meta bootstrap-restored
+    BOOTSTRAP=0
+    [ "$user_result" -ne 0 ] || meta bootstrap-done
+  fi
+  exit "$user_result"
+fi
+confirm "Build and validate local sources, then drain/backup before any needed cutover?"
+old_proxy=$(dce ps -q proxy)
+if [ -n "$old_proxy" ]; then
+  docker cp "$old_proxy:/data/caddy/pki/authorities/local/root.crt" "$STATE/work/previous-public-ca.crt" 2>/dev/null || true
+fi
+if [ "$COMMAND" = redeploy ] || [ "$COMMAND" = fresh ]; then
+  meta snapshot
+  while IFS='|' read -r service image dockerfile context commit; do
+    [ -n "$service" ] || continue
+    echo "Building $service from its frozen local source."
+    if [ "$service" = homebox ]; then
+      docker build --build-arg "COMMIT=$commit" -f "$dockerfile" -t "$image" "$context"
+    else docker build -f "$dockerfile" -t "$image" "$context"; fi
+    docker image inspect "$image" >"$STATE/work/image-$service.json"
+    case "$service" in
+      assistant-api|homebox-mcp)
+        docker run --rm --network none --read-only --cap-drop ALL \
+          --security-opt no-new-privileges:true --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+          "$image" python -m pytest -q -p no:cacheprovider
+        ;;
+    esac
+  done <"$STATE/work/builds.txt"
+  meta plan
+  IFS= read -r api_image <"$STATE/work/api-image.txt"
+  set -- "$api_image" python -B /lifecycle/metadata.py semantic
+  if [ "$EXTERNAL" = 1 ]; then
+    set -- --mount "type=bind,source=$DEPLOY/secrets/ai,target=/run/secrets/ai,readonly" "$@"
+  fi
+  docker run --rm -i --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges:true --env PYTHONPATH=/app \
+    --mount "type=bind,source=$ROOT/deploy/lifecycle,target=/lifecycle,readonly" \
+    "$@" <"$STATE/work/api-environment.json"
+  while IFS='|' read -r image alias; do
+    [ -n "$image" ] || continue
+    docker tag "$image" "$alias"
+  done <"$STATE/work/aliases.txt"
+  IFS= read -r CHANGES <"$STATE/work/has-changes"
+  if [ "$CHANGES" = 0 ]; then
+    echo "No image or configuration change. Existing containers and data remain untouched."
+    meta finish
+    model_status
+    exit 0
+  fi
+fi
+drain() {
+  api=$(dce ps -q assistant-api)
+  [ -n "$api" ] || return 0
+  docker exec "$api" python -B -c '
+import json,os,sqlite3
+p=os.environ.get("ASSISTANT_STATE_PATH","/data/assistant.db")
+with sqlite3.connect("file:"+p+"?mode=ro",uri=True,timeout=5) as c:
+ print(json.dumps([c.execute("SELECT count(*) FROM capture_jobs WHERE status=?", (s,)).fetchone()[0] for s in ("queued","running")]+[c.execute("SELECT count(*) FROM "+t+" WHERE status=?",("running",)).fetchone()[0] for t in ("actions","chat_turns")]))
+' >"$STATE/work/counts.json"
+  meta idle
+}
+proxy=$(dce ps -q proxy)
+if [ -n "$proxy" ]; then
+  dce stop --timeout -1 proxy
+  PROXY_STOPPED=1
+fi
+# Do not interrupt active user work. Bounded waiting never force-cancels it.
+attempt=0
+until drain; do
+  attempt=$((attempt + 1))
+  [ "$attempt" -lt 60 ] || { echo "Work did not drain; no cutover performed." >&2; exit 1; }
+  sleep 5
+done
+capture
+meta resources
+if [ "$COMMAND" = backup ] || [ "$COMMAND" = redeploy ]; then
+  meta phase backing-up
+  archive="lifecycle-$(date -u +%Y%m%dT%H%M%SZ)-$$.tar.gz"
+  HOMEBOX_BACKUP_EXTERNAL_AI="$EXTERNAL" HOMEBOX_BACKUP_LAN_HTTPS="$LAN" \
+    HOMEBOX_BACKUP_STOP_TIMEOUT=-1 COMPOSE_PROJECT_NAME="$PROJECT" \
+    HOMEBOX_DEPLOY_DIR="$DEPLOY" HOMEBOX_ENV_FILE="$DEPLOY/.env" HOMEBOX_BACKUP_DIR="$DEPLOY/backups" \
+    HOMEBOX_COMPOSE_OVERRIDE="$TEST_OVERRIDE" \
+    sh "$DEPLOY/scripts/backup.sh" "$archive"
+  meta backup "$archive"
+fi
+if [ "$COMMAND" = backup ]; then meta phase ready; exit 0; fi
+capture
+meta resources
+meta cutover
+CUTOVER=1
+if [ "$COMMAND" = fresh ]; then
+  dce up -d --no-build --pull missing --wait --wait-timeout 240
+else
+  while IFS= read -r service; do
+    [ -n "$service" ] || continue
+    dce up -d --no-deps --no-build --pull never --wait --wait-timeout 240 "$service"
+  done <"$STATE/work/changes.txt"
+  dce up -d --no-deps --no-recreate --no-build --pull never --wait --wait-timeout 180 proxy
+fi
+PROXY_STOPPED=0
+capture
+meta verify
+meta bind-resources
+proxy=$(dce ps -q proxy)
+pwa=$(dce ps -q pwa)
+meta prepare-static
+docker cp "$pwa:/usr/share/nginx/html/." "$STATE/work/static/"
+docker cp "$proxy:/data/caddy/pki/authorities/local/root.crt" "$STATE/work/public-ca.crt" 2>/dev/null || true
+docker run --rm --network "container:$proxy" --read-only --cap-drop ALL \
+  --security-opt no-new-privileges:true --user "$(id -u):$(id -g)" \
+  --mount "type=bind,source=$ROOT,target=/source,readonly" \
+  --mount "type=bind,source=$STATE,target=/state" \
+  "$PYTHON" python -B /source/deploy/lifecycle/metadata.py smoke
+if [ "$LAN" = 1 ]; then
+  IFS= read -r lan_ip <"$STATE/work/lan-ip.txt"
+  IFS= read -r fixed_hosts <"$STATE/work/fixed-localhost.txt"
+  if [ "$fixed_hosts" = 1 ]; then
+    docker run --rm --network "container:$proxy" --read-only --cap-drop ALL \
+      --security-opt no-new-privileges:true --user "$(id -u):$(id -g)" \
+      -e "LAN_IP=$lan_ip" -e LAN_CA_FILE=/public-ca.crt \
+      --mount "type=bind,source=$ROOT/deploy/tests/check_lan_access.py,target=/ops/check_lan_access.py,readonly" \
+      --mount "type=bind,source=$STATE/work/public-ca.crt,target=/public-ca.crt,readonly" \
+      "$api_image" python -B /ops/check_lan_access.py
+  else
+    echo "Custom hostnames: dynamic Origin matrix passed; fixed-localhost regression is not applicable."
+  fi
+fi
+meta finish
+OK=1
+echo "Services are healthy; public HTTPS/auth/static checks passed. No inference was performed."
+model_status

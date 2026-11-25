@@ -1,4 +1,6 @@
 .env
+.env.lifecycle-owner
+.homebox-operation.lock/
 secrets/
 backups/
 *.rendered.json

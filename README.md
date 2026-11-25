@@ -80,6 +80,8 @@ docker run -d \
 
 This fork includes a separate mobile companion for chat, reviewed photo intake, and NFC/QR links. Homebox remains the inventory system of record. See the [companion setup and limitations](docs/assistant/README.md) and [isolated Docker deployment](deploy/README.md).
 
+For fresh installation, local source redeployment that preserves data, and native user access, see the [local deployment utility](docs/assistant/local-lifecycle.md). Existing installations require explicit adoption before maintenance.
+
 <!-- CONTRIBUTING -->
 
 ## Contributing
