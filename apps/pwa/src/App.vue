@@ -2,14 +2,21 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { ApiError, createApi } from "./api";
 import { confirmationKey, emptyDraft, tagNames, tagRoute, validatePhoto } from "./helpers";
-import type { Action, ActionType, Capture, Chat, Draft, Entity, Location, Mapping, Session } from "./types";
+import type { Action, ActionType, CaptureJob, Draft, Entity, Location, Mapping, Session } from "./types";
+import { mergeCaptureDraft, type DraftField } from "./capture-draft";
+import { useCaptureJobs } from "./useCaptureJobs";
+import { useConversation } from "./useConversation";
+import ConversationPanel from "./components/ConversationPanel.vue";
+import "./conversation.css";
 import ActionCard from "./components/ActionCard.vue";
+import AiDetails from "./components/AiDetails.vue";
+import CaptureProgress from "./components/CaptureProgress.vue";
 import DraftForm from "./components/DraftForm.vue";
 import EntityList from "./components/EntityList.vue";
 import TagPanel from "./components/TagPanel.vue";
 
 const session = ref<Session | null>(null);
-const api = createApi(() => session.value?.csrfToken, () => epoch, () => session.value?.collectionId);
+const api = createApi(() => session.value?.csrfToken, () => epoch, () => session.value?.collectionId, () => session.value?.scope?.contextVersion);
 const initialLoading = ref(true);
 const busy = ref(false);
 const busyLabel = ref("");
@@ -24,8 +31,6 @@ const query = ref("");
 const results = ref<Entity[]>([]);
 const resultTotal = ref(0);
 const searched = ref(false);
-const message = ref("");
-const transcript = ref<{ role: "user" | "assistant"; text: string; items?: Entity[]; choices?: Entity[] }[]>([]);
 const action = ref<Action | null>(null);
 const history = ref<Action[]>([]);
 const recoveryReady = ref(false);
@@ -53,8 +58,76 @@ const tagId = ref(tagRoute(window.location.pathname));
 const tagError = ref("");
 const mappingLabel = ref("");
 let epoch = 0;
+let photoIntent = 0;
+let actionIntent = 0;
+let draftEditVersion = 0;
+let captureFormVersion = 0;
+let draftReview: { actionId: string; photoIntent: number; editVersion: number; captureId?: string } | null = null;
+let captureBaseline = emptyDraft();
+const editedCaptureFields = new Set<DraftField>();
+function rememberCaptureEdits() {
+  captureFormVersion = draftEditVersion;
+  captureBaseline = { ...draft.value, tags: [...draft.value.tags] };
+  editedCaptureFields.clear();
+}
+function recordDraftEdit(field: DraftField) { draftEditVersion++; editedCaptureFields.add(field); }
+function updateDraftLocation(value: string) { draftEditVersion++; draftLocation.value = value; }
+const captureJobs = useCaptureJobs({
+  api,
+  context: () => `${epoch}:${photoIntent}`,
+  online: () => online.value,
+  receive(response) {
+    captureId.value = response.captureId;
+    draft.value = mergeCaptureDraft(draft.value, response.draft, captureBaseline, editedCaptureFields);
+    duplicates.value = response.duplicates; warnings.value = response.warnings;
+    if (response.locations.length) locations.value = response.locations;
+    notice.value = response.draft.name
+      ? "Photo suggestions are ready. Your manual edits were kept. Review before saving."
+      : "Photo uploaded. Enter the item details manually, then review before saving.";
+  },
+  boundaryError(cause) {
+    if (cause instanceof ApiError && cause.status === 403) {
+      clearPrivate(); session.value = null;
+      error.value = "Access to this photo is no longer available. Sign in again to refresh collection access.";
+    } else { void handleFailure(cause, "Checking photo status"); }
+  },
+});
+const { job: captureJob, jobs: captureHistory, issue: captureIssue, pending: capturePending } = captureJobs;
 const pending = computed(() => action.value && !["succeeded", "cancelled"].includes(action.value.status));
 const currentCollection = computed(() => session.value?.collections.find(c => c.id === session.value?.collectionId)?.name || "Choose a collection");
+const conversation = useConversation({
+  api, context: () => epoch, scope: () => session.value?.scope, online: () => online.value,
+  actionGeneration: () => actionIntent,
+  hasUnsafeAction: () => !!pending.value,
+  retireAction(id) {
+    if (action.value?.id === id && ["proposed", "failed"].includes(action.value.status)) {
+      // An empty chat is not an authoritative action-status read.
+      action.value = { ...action.value, status: "uncertain", error: "This cached review is no longer linked to a current conversation. Check its status before acting." };
+    }
+  },
+  receiveAction(value, ownership) {
+    if (draftReview && (draftReview.actionId === value.id
+      || (draftReview.captureId ? ownership.captureId === draftReview.captureId : ownership.previousActionId === draftReview.actionId))) {
+      draftReview = { ...draftReview, actionId: value.id };
+    } else if (ownership.captureId && ownership.captureId === captureId.value) {
+      draftReview = { actionId: value.id, photoIntent, captureId: ownership.captureId, editVersion: captureFormVersion };
+    }
+    if (value.type === "item.create" && value.status === "succeeded" && ownership.captureId) captureJobs.consume(ownership.captureId);
+    action.value = value;
+  },
+  async boundaryError(cause) {
+    if (cause instanceof ApiError && cause.status === 403) {
+      clearPrivate(); session.value = null; error.value = "Access changed. Sign in again to refresh your collection access.";
+    } else await handleFailure(cause, "Asking your inventory");
+  },
+});
+const conversationAction = computed(() => !!action.value && action.value.id === conversation.state.linkedActionId);
+const conversationRecoveryBlocked = computed(() => conversation.state.recovering || conversation.state.unsettled || conversation.state.sending);
+const conversationConfirmBlocked = computed(() => conversationRecoveryBlocked.value || (conversationAction.value && conversation.state.editing));
+function belongsToLocalDraft(value: Action) {
+  return draftReview?.actionId === value.id && draftReview.photoIntent === photoIntent;
+}
+const reviewPhoto = computed(() => action.value && belongsToLocalDraft(action.value) ? preview.value : "");
 const matchingLocations = computed(() => locations.value.filter(location =>
   !query.value.trim() || `${location.path} ${location.name}`.toLocaleLowerCase().includes(query.value.toLocaleLowerCase())));
 watch(() => action.value?.id, id => {
@@ -64,7 +137,25 @@ watch(() => action.value?.id, id => {
   window.history.replaceState(null, "", url);
 });
 watch(action, current => {
-  if (current) history.value = [current, ...history.value.filter(previous => previous.id !== current.id)].slice(0, 50);
+  if (current) {
+    history.value = [current, ...history.value.filter(previous => previous.id !== current.id)].slice(0, 50);
+    conversation.syncAction(current);
+    if (draftReview?.actionId === current.id) {
+      if (current.status === "succeeded" && current.type === "item.create") {
+        const consumed = draftReview;
+        draftReview = null;
+        if (consumed.captureId) captureJobs.consume(consumed.captureId);
+        if (consumed.photoIntent === photoIntent && consumed.captureId === captureId.value) {
+          if (consumed.editVersion === draftEditVersion) resetDraft();
+          else {
+            clearPhoto();
+            notice.value = "The reviewed photo was saved. Your newer manual details were kept. Choose a new photo before preparing another item.";
+          }
+        }
+      }
+      else if (current.status === "cancelled") draftReview = null;
+    }
+  }
 });
 
 function updateOnline() { online.value = navigator.onLine; }
@@ -74,19 +165,23 @@ function removeActionQuery() {
   window.history.replaceState(null, "", url);
 }
 function clearPhoto() {
+  photoIntent++; captureJobs.detach(); editedCaptureFields.clear();
   if (preview.value) URL.revokeObjectURL(preview.value);
   photo.value = null; preview.value = ""; hint.value = "";
   captureId.value = undefined; duplicates.value = []; warnings.value = [];
   if (fileInput.value) fileInput.value.value = "";
 }
 function resetDraft() {
+  draftEditVersion++;
   clearPhoto(); draft.value = emptyDraft(); captureId.value = undefined;
   duplicates.value = []; warnings.value = []; draftLocation.value = "";
 }
 function clearPrivate() {
+  draftReview = null; draftEditVersion++;
   epoch++; locations.value = []; results.value = []; resultTotal.value = 0; searched.value = false;
-  transcript.value = []; query.value = ""; message.value = ""; action.value = null;
+  conversation.reset(); actionIntent++; query.value = ""; action.value = null;
   history.value = []; recoveryReady.value = false;
+  captureJobs.reset();
   recoveryWarning.value = ""; removeActionQuery();
   detail.value = null; contents.value = []; mappings.value = [];
   editMode.value = ""; mappingLabel.value = ""; resetDraft(); tagError.value = "";
@@ -98,7 +193,10 @@ async function perform(label: string, task: () => Promise<void>) {
   if (!online.value) { error.value = "You’re offline. Reconnect to read or change inventory. Private inventory is not saved on this device."; return; }
   busy.value = true; busyLabel.value = label; error.value = ""; notice.value = "";
   try { await task(); }
-  catch (cause) {
+  catch (cause) { await handleFailure(cause, label); }
+  finally { busy.value = false; busyLabel.value = ""; }
+}
+async function handleFailure(cause: unknown, label: string) {
     if (cause instanceof ApiError && cause.code === "stale_response") return;
     if (cause instanceof ApiError && cause.code === "COLLECTION_CONTEXT_CHANGED") {
       clearPrivate();
@@ -116,7 +214,6 @@ async function perform(label: string, task: () => Promise<void>) {
       clearPrivate(); session.value = null;
       error.value = label === "Signing in" ? cause.message : "Your session ended. Sign in again to continue.";
     } else { error.value = cause instanceof Error ? cause.message : "Something went wrong. Please try again."; }
-  } finally { busy.value = false; busyLabel.value = ""; }
 }
 async function loadLocations() {
   const version = epoch;
@@ -152,6 +249,9 @@ async function afterSignIn() {
     action.value = recent.actions.find(candidate => ["proposed", "running", "uncertain", "failed"].includes(candidate.status)) || null;
   }
   await loadLocations(); await resolveTag();
+  rememberCaptureEdits();
+  await captureJobs.recover();
+  await conversation.recover();
   recoveryReady.value = true;
 }
 async function login() {
@@ -171,6 +271,10 @@ async function logout() {
 async function changeCollection(event: Event) {
   const id = (event.target as HTMLSelectElement).value;
   (event.target as HTMLSelectElement).value = session.value?.collectionId || "";
+  await switchCollection(id);
+}
+async function switchCollection(id: string) {
+  if (!session.value?.collections.some(collection => collection.id === id)) return;
   if (id === session.value?.collectionId) return;
   await perform("Changing collection", async () => {
     clearPrivate();
@@ -178,20 +282,18 @@ async function changeCollection(event: Event) {
     await afterSignIn();
   });
 }
+async function selectHistoryAction(value: Action) {
+  const intent = ++actionIntent;
+  await perform("Checking previous change", async () => {
+    const current = await api<Action>(`/actions/${encodeURIComponent(value.id)}`);
+    if (intent === actionIntent) action.value = current;
+  });
+}
+function dismissAction() { actionIntent++; action.value = null; }
 async function search() {
   await perform("Searching inventory", async () => {
     const response = await api<{ items: Entity[]; total: number }>(`/items?q=${encodeURIComponent(query.value.trim())}`);
     results.value = response.items; resultTotal.value = response.total; searched.value = true;
-  });
-}
-async function chat() {
-  if (!message.value.trim() || pending.value) return;
-  const text = message.value.trim();
-  await perform("Asking your inventory", async () => {
-    const response = await api<Chat>("/chat", { method: "POST", body: { message: text } });
-    transcript.value.push({ role: "user", text }, { role: "assistant", text: response.message, items: response.items, choices: response.choices?.candidates });
-    message.value = "";
-    if (response.action) { action.value = response.action; detail.value = null; }
   });
 }
 async function openEntity(entity: Entity) {
@@ -215,36 +317,58 @@ function choosePhoto(event: Event) {
   captureId.value = undefined; duplicates.value = []; warnings.value = []; error.value = "";
 }
 async function analyze() {
-  if (!photo.value) return;
-  await perform("Analyzing photo, this can take a moment on your home server", async () => {
+  if (!photo.value || capturePending.value) return;
+  rememberCaptureEdits();
+  await perform("Uploading photo to your home server", async () => {
     const form = new FormData();
     form.append("image", photo.value!);
     if (hint.value.trim()) form.append("hint", hint.value.trim());
     if (draftLocation.value) form.append("locationId", draftLocation.value);
-    const response = await api<Capture>("/captures", { method: "POST", body: form });
-    captureId.value = response.captureId;
-    draft.value = { ...emptyDraft(), ...response.draft };
-    duplicates.value = response.duplicates; warnings.value = response.warnings;
-    if (response.locations.length) locations.value = response.locations;
-    notice.value = response.draft.name
-      ? "Suggestions ready. Check the details below before saving."
-      : "Photo uploaded. Enter the item details manually, then review before saving.";
+    await captureJobs.submit(form);
   });
 }
+function resumeCaptureJob(value: CaptureJob) {
+  clearPhoto(); rememberCaptureEdits(); captureJobs.select(value);
+  detail.value = null; tab.value = "capture";
+}
 async function propose(type: ActionType, payload: Record<string, unknown>, photoId?: string) {
+  if (conversationRecoveryBlocked.value) { error.value = "Check the current conversation request before reviewing another change. Your entered details are still here."; return; }
   if (!recoveryReady.value || pending.value) { error.value = "Load recent changes, then finish or cancel the current change first."; return; }
+  actionIntent++;
   await perform("Preparing change for review", async () => {
-    action.value = await api<Action>("/actions", { method: "POST", body: { type, payload, ...(photoId ? { captureId: photoId } : {}) } });
+    try {
+      const proposed = await api<Action>("/actions", { method: "POST", body: { type, payload, ...(photoId ? { captureId: photoId } : {}) } });
+      if (type === "item.create") draftReview = { actionId: proposed.id, photoIntent, editVersion: draftEditVersion, captureId: photoId };
+      action.value = proposed;
+    } catch (cause) {
+      if (!(cause instanceof ApiError && cause.status === 409 && cause.code !== "COLLECTION_CONTEXT_CHANGED")) throw cause;
+      // A concurrent chat/manual workflow can win the server's proposal lock.
+      // Inspect it without retrying this submission or discarding the local form/photo.
+      conversation.state.unsettled = true;
+      conversation.state.issue = "Another change is pending. Check the conversation before preparing or confirming another change.";
+      try {
+        const recent = await api<{ actions: Action[] }>("/actions");
+        history.value = recent.actions;
+        action.value = recent.actions.find(candidate => ["proposed", "running", "uncertain", "failed"].includes(candidate.status)) || action.value;
+        await conversation.recover();
+      } catch (recoveryError) {
+        if (recoveryError instanceof ApiError && [401, 403, 409].includes(recoveryError.status)) throw recoveryError;
+        recoveryWarning.value = "Could not load the existing change. Check recent changes before preparing another item.";
+      }
+      throw new ApiError(cause.status, cause.code, `${cause.message} Your photo and entered details are still here. Check the existing change before preparing another.`);
+    }
     detail.value = null;
   });
 }
 async function proposeCreate() {
+  if (capturePending.value) { error.value = "The photo is still processing. Keep editing, or remove the photo to continue without it."; return; }
   await propose("item.create", {
     ...draft.value, name: draft.value.name.trim(), ...(draftLocation.value ? { locationId: draftLocation.value } : {}),
   }, captureId.value);
 }
 async function confirm() {
   const current = action.value;
+  if (conversationConfirmBlocked.value) return;
   if (!current || !(current.status === "proposed" || (current.status === "failed" && current.retryable === true))) return;
   await perform("Saving confirmed change", async () => {
     const key = confirmationKey(current);
@@ -253,15 +377,16 @@ async function confirm() {
         method: "POST", body: { revision: current.revision }, idempotencyKey: key,
       });
     } catch (cause) {
+      if (cause instanceof ApiError && ["stale_response", "request_cancelled"].includes(cause.code)) throw cause;
       // A lost response must never present a fresh create/confirm as the default.
       action.value = { ...current, status: "uncertain" };
       throw cause;
     }
     if (action.value.status === "succeeded") {
-      if (action.value.type === "item.create") resetDraft();
       results.value = []; searched.value = false;
       await loadLocations();
     }
+    if (conversationAction.value) await conversation.recover();
   });
 }
 async function refreshAction() {
@@ -269,15 +394,17 @@ async function refreshAction() {
   await perform("Checking change status", async () => {
     action.value = await api<Action>(`/actions/${encodeURIComponent(action.value!.id)}`);
     if (action.value.status === "succeeded") {
-      if (action.value.type === "item.create") resetDraft();
       await loadLocations();
     }
+    if (conversationAction.value) await conversation.recover();
   });
 }
 async function cancelAction() {
+  if (conversationRecoveryBlocked.value) return;
   if (!action.value) return;
   await perform("Cancelling proposal", async () => {
     action.value = await api<Action>(`/actions/${encodeURIComponent(action.value!.id)}/cancel`, { method: "POST", body: {} });
+    if (conversationAction.value) await conversation.recover();
   });
 }
 function beginEdit(mode: "move" | "edit" | "tags") {
@@ -322,7 +449,7 @@ onMounted(async () => {
   } finally { initialLoading.value = false; }
 });
 onUnmounted(() => {
-  clearPhoto(); window.removeEventListener("online", updateOnline); window.removeEventListener("offline", updateOnline);
+  conversation.reset(); clearPhoto(); window.removeEventListener("online", updateOnline); window.removeEventListener("offline", updateOnline);
 });
 </script>
 
@@ -332,6 +459,7 @@ onUnmounted(() => {
     <header class="app-header">
       <a href="/" class="brand" aria-label="Homebox Companion home"><img src="/icon.svg" width="38" height="38" alt=""><span>homebox<small>COMPANION</small></span></a>
       <span class="private-label">On your home server</span>
+      <AiDetails v-if="session" :ai="session.ai"/>
       <button v-if="session" class="text-button" :disabled="busy || !online" @click="logout">Sign out</button>
     </header>
     <main id="main">
@@ -341,7 +469,7 @@ onUnmounted(() => {
       <div v-if="busy" class="busy-status" role="status"><span class="spinner" aria-hidden="true"></span>{{ busyLabel }}…</div>
       <section v-if="initialLoading" class="card loading" aria-label="Loading session">Connecting to your inventory…</section>
       <section v-else-if="!session" class="login-layout">
-        <div class="intro"><p class="eyebrow">A little less searching</p><h1>Everything has<br>a place.</h1><p>Find it, photograph it, and put it back where it belongs.</p><div class="privacy-note">Your inventory and photos stay on your home server. AI suggests. You decide.</div></div>
+        <div class="intro"><p class="eyebrow">A little less searching</p><h1>Everything has<br>a place.</h1><p>Find it, photograph it, and put it back where it belongs.</p><div class="privacy-note">Your inventory stays in Homebox. AI suggestions are optional and always need your review.</div></div>
         <div class="card login-card">
           <h2>Welcome home</h2><p class="muted">Sign in with your existing Homebox account.</p>
           <p v-if="tagId" class="inset">You opened a storage tag. Sign in to view it. The tag does not grant access to inventory.</p>
@@ -363,10 +491,12 @@ onUnmounted(() => {
         <p v-if="tagId && mappingLabel && detail" class="tag-context">Opened from tag: {{ mappingLabel }}</p>
         <div v-if="!recoveryReady && !busy" class="banner warning">Recent changes must load before you continue.<button class="secondary" :disabled="!online" @click="perform('Loading recent changes', afterSignIn)">Load recent changes</button></div>
         <fieldset class="workspace" :disabled="busy || !online || !session.collectionId || !recoveryReady">
-          <details v-if="history.length" class="card" open><summary>Recent changes &amp; recovery ({{ history.length }})</summary><p class="small muted">Check previous attempts before creating the same item again. Uncertain changes are never retried automatically.</p><ul class="plain-list"><li v-for="previous in history" :key="previous.id"><button class="text-button" type="button" @click="action = previous">{{ previous.summary }} · {{ previous.status }}</button></li></ul></details>
-          <ActionCard v-if="action" :action="action" :busy="busy" :photo-preview="action.type === 'item.create' && captureId ? preview : ''" @confirm="confirm" @cancel="cancelAction" @refresh="refreshAction" @dismiss="action = null" @open="view"/>
+          <CaptureProgress v-if="captureJob || captureIssue || capturePending" :job="captureJob" :pending="capturePending" :issue="captureIssue" :has-local-photo="!!preview" @open="detail = null; tab = 'capture'" @dismiss="clearPhoto"/>
+          <details v-if="captureHistory.length" class="card"><summary>Recent photo jobs ({{ captureHistory.length }})</summary><p class="small muted">Resume an existing upload instead of sending it again. Check recent inventory changes before creating an item from an older photo.</p><ul class="plain-list"><li v-for="previous in captureHistory" :key="previous.id"><button type="button" class="text-button" @click="resumeCaptureJob(previous)">{{ new Date(previous.createdAt).toLocaleString() }} · {{ previous.status }}</button></li></ul></details>
+          <details v-if="history.length" class="card"><summary>Recent changes &amp; recovery ({{ history.length }})</summary><p class="small muted">Check previous attempts before creating the same item again. Uncertain changes are never retried automatically.</p><ul class="plain-list"><li v-for="previous in history" :key="previous.id"><button class="text-button" type="button" :data-action-id="previous.id" @click="selectHistoryAction(previous)">{{ previous.summary }} · {{ previous.status }}</button></li></ul></details>
+          <ActionCard v-if="action && (!conversationAction || detail || tab !== 'ask')" :action="action" :busy="busy || conversation.state.sending || (conversationAction && (conversation.state.unsettled || conversation.state.recovering))" :confirm-disabled="conversationConfirmBlocked" :cancel-disabled="conversationRecoveryBlocked" :photo-preview="reviewPhoto" @confirm="confirm" @cancel="cancelAction" @refresh="refreshAction" @dismiss="dismissAction" @open="view"/>
           <section v-if="detail" class="card detail-view">
-            <button class="text-button" type="button" @click="detail = null; editMode = ''">‹ Back to inventory</button>
+            <button class="text-button" type="button" aria-label="Back to inventory" @click="detail = null; editMode = ''">‹ Back to inventory</button>
             <p class="eyebrow">{{ detail.isLocation ? "Location" : "Inventory item" }}</p><h2>{{ detail.name }}</h2>
             <p class="location-path">{{ detail.locationPath || "No location assigned" }}</p>
             <p v-if="detail.description">{{ detail.description }}</p>
@@ -391,14 +521,15 @@ onUnmounted(() => {
           <template v-else>
             <nav class="tabs" aria-label="Companion tools"><button :aria-current="tab === 'ask' ? 'page' : undefined" @click="tab = 'ask'">Find &amp; ask</button><button :aria-current="tab === 'capture' ? 'page' : undefined" @click="tab = 'capture'">Add an item</button><button :aria-current="tab === 'places' ? 'page' : undefined" @click="tab = 'places'">Places</button></nav>
             <section v-if="tab === 'ask'" class="stack">
-              <div class="hero-copy"><p class="eyebrow">Less digging. More finding.</p><h2>What are you looking for?</h2><p class="muted">Ask about your things, or search by name.</p></div>
-              <form class="search-row" @submit.prevent="search"><label class="grow"><span class="sr-only">Search inventory</span><input v-model="query" type="search" placeholder="Camping stove, spare cables…" maxlength="1000"></label><button type="submit" class="primary">Search</button></form>
+              <ConversationPanel :state="conversation.state" :collection-name="currentCollection" :action="action" :disabled="busy || !online || !recoveryReady"
+                @composer="conversation.updateComposer" @send="conversation.send" @retry="conversation.retry" @recover="conversation.recover" @restore="conversation.restore"
+                @select="conversation.select" @page="conversation.page" @inspect="view" @collection="switchCollection" @fresh="conversation.fresh"
+                @edit="conversation.edit" @stop-edit="conversation.state.editing = false">
+                <template #review="{ edit }"><ActionCard v-if="action && conversationAction" :action="action" :busy="busy || conversation.state.sending || conversation.state.recovering || conversation.state.unsettled" :editable="action.status === 'proposed' && !conversation.state.editing" :confirm-disabled="conversationConfirmBlocked" :cancel-disabled="conversationRecoveryBlocked" :photo-preview="reviewPhoto"
+                  @confirm="confirm" @edit="edit" @cancel="cancelAction" @refresh="refreshAction" @dismiss="dismissAction" @open="view"/></template>
+              </ConversationPanel>
+              <form class="search-row" @submit.prevent="search"><label class="grow"><span class="sr-only">Search inventory</span><input v-model="query" type="search" placeholder="Search items directly by name…" maxlength="1000"></label><button type="submit" class="primary">Search</button></form>
               <section v-if="searched" class="card"><h3>{{ resultTotal }} {{ resultTotal === 1 ? "result" : "results" }}</h3><EntityList :items="results" @open="view"/><p v-if="!results.length" class="muted">No matching items. Try fewer words or browse Places.</p><p v-if="resultTotal > results.length" class="small muted">Showing {{ results.length }} of {{ resultTotal }} matches. Narrow your search to find the right item.</p></section>
-              <section class="card chat-panel" aria-label="Inventory conversation">
-                <div v-if="!transcript.length" class="chat-welcome"><div class="assistant-mark" aria-hidden="true">◇</div><h3>Your things, in a few words.</h3><p class="muted">“Where is my camping stove?”<br>“What is in the electronics box?”<br>“Move the HDMI cable to the study.”</p><p class="small muted">Results come from Homebox. Every proposed change needs your confirmation.</p></div>
-                <ol v-else class="transcript" aria-live="polite"><li v-for="(turn, index) in transcript" :key="index" :class="['turn', turn.role]"><p class="eyebrow">{{ turn.role === "user" ? "You" : "Homebox" }}</p><p class="message-text">{{ turn.text }}</p><EntityList v-if="turn.items?.length" :items="turn.items" @open="view"/><template v-if="turn.choices?.length"><h3>Choose a record to inspect</h3><p class="small muted">Open the exact record, then use its Move or Edit actions. Nothing is changed by choosing.</p><EntityList :items="turn.choices" @open="view"/></template></li></ol>
-                <form class="stack" @submit.prevent="chat"><label>Ask your inventory<textarea v-model="message" rows="2" placeholder="Where did I put…" maxlength="4000" required :disabled="!!pending"></textarea></label><p v-if="pending" class="small muted">Finish the change above before asking for another one.</p><button type="submit" class="primary" :disabled="!!pending || !message.trim()">Ask Homebox</button></form>
-              </section>
             </section>
             <section v-if="tab === 'capture'" class="stack">
               <div class="hero-copy"><p class="eyebrow">A new thing, a proper home</p><h2>Start with a photo.<br>Or just the details.</h2><p class="muted">You review every suggestion before anything is saved.</p></div>
@@ -407,11 +538,13 @@ onUnmounted(() => {
                 <section class="card stack">
                   <label class="photo-picker">Take or choose a photo<input ref="fileInput" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" capture="environment" @change="choosePhoto"></label>
                   <p class="small muted">JPEG, PNG, WebP, HEIC or HEIF · up to 12 MB. Your server validates the photo. Device HEIC support varies.</p>
-                  <template v-if="preview"><img :src="preview" class="photo-preview" alt="Selected item photo preview"><label>Optional hint<input v-model="hint" placeholder="Anything the camera can’t see?" maxlength="1000"></label><div class="button-row"><button class="primary" @click="analyze">Suggest details from photo</button><button class="secondary" @click="clearPhoto">Remove photo</button></div><p v-if="!captureId" class="small muted">Send the photo to your server before reviewing the item to attach it. If the model is unavailable, an accepted upload can still be saved with manually entered details.</p></template>
+                  <template v-if="preview"><img :src="preview" class="photo-preview" alt="Selected item photo preview"><label>Optional hint<input v-model="hint" placeholder="Anything the camera can’t see?" maxlength="1000" :disabled="capturePending"></label><div class="button-row"><button class="primary" :disabled="capturePending" @click="analyze">Suggest details from photo</button><button class="secondary" @click="clearPhoto">Remove photo</button></div><p v-if="!captureId" class="small muted">Send the photo to your server before reviewing the item to attach it. If the model is unavailable, an accepted upload can still be saved with manually entered details.</p></template>
+                  <div v-else-if="captureId" class="inset stack"><p>Your uploaded photo is retained on the server. A local preview is not available after reload.</p><button type="button" class="secondary" @click="clearPhoto">Remove uploaded photo</button></div>
                 </section>
                 <section class="card stack"><h3>{{ captureId ? "Review item details" : "Enter item details" }}</h3><p v-for="warning in warnings" :key="warning" class="banner warning">{{ warning }}</p>
                   <section v-if="duplicates.length"><h3>Possible duplicates</h3><p class="small muted">These are suggestions, not automatic merges. Check them before creating another item.</p><EntityList :items="duplicates" @open="view"/></section>
-                  <DraftForm v-model="draft" v-model:location-id="draftLocation" :locations="locations" @submit="proposeCreate"/>
+                  <p v-if="capturePending" class="small muted">You can edit details while the photo is processing. Review when it finishes, or remove the photo to continue without attaching it.</p>
+                  <DraftForm v-model="draft" :location-id="draftLocation" @update:location-id="updateDraftLocation" :locations="locations" :review-disabled="capturePending" @edit="recordDraftEdit" @submit="proposeCreate"/>
                   <button type="button" class="text-button" @click="resetDraft">Clear draft and photo</button>
                 </section>
               </template>

@@ -1,0 +1,46 @@
+import /etc/caddy/Caddyfile.base
+
+https://{$PROXY_LAN_IP} {
+	import transport_security
+	header {
+		Permissions-Policy "camera=(self), microphone=(), geolocation=()"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+	}
+	@untrusted_nonget {
+		not method GET
+		expression `{http.request.header.Origin} != "https://{$PROXY_LAN_IP}"`
+	}
+	@trusted_lan_origin expression `{http.request.header.Origin} == "https://{$PROXY_LAN_IP}"`
+	@assistant_api path /api/assistant/v1 /api/assistant/v1/*
+	route {
+		# Literal order is security-critical: validate the original header first.
+		# Header placeholders join duplicates, so a second Origin is not accepted.
+		respond @untrusted_nonget "Origin not allowed" 403
+		request_header @trusted_lan_origin Origin https://{$ASSISTANT_HOST}
+		handle @assistant_api {
+			header Cache-Control no-store
+			request_body {
+				max_size 16MB
+			}
+			reverse_proxy assistant-api:8000
+		}
+		handle /api/* {
+			respond "Not found" 404
+		}
+		handle {
+			reverse_proxy pwa:8080
+		}
+	}
+}
+
+https://{$PROXY_LAN_IP}:8443 {
+	import transport_security
+	@untrusted_native_nonget {
+		not method GET
+		expression `{http.request.header.Origin} != "https://{$PROXY_LAN_IP}:8443"`
+	}
+	route {
+		respond @untrusted_native_nonget "Origin not allowed" 403
+		reverse_proxy homebox:7745
+	}
+}

@@ -1,7 +1,7 @@
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Strict(BaseModel):
@@ -19,8 +19,31 @@ class Collection(Strict):
     collectionId: UUID
 
 
+class ChatSelection(Strict):
+    clarificationId: str = Field(min_length=1, max_length=100)
+    candidateId: str = Field(min_length=1, max_length=100)
+
+
+class ChatContinuation(Strict):
+    id: str = Field(min_length=1, max_length=100)
+
+
 class Message(Strict):
-    message: str = Field(min_length=1, max_length=2000)
+    message: str | None = Field(default=None, min_length=1, max_length=2000)
+    conversationId: str | None = Field(default=None, min_length=1, max_length=100)
+    clientTurnId: str | None = Field(default=None, min_length=8, max_length=128)
+    expectedRevision: int | None = Field(default=None, ge=0)
+    mode: Literal["normal", "read_only"] = "normal"
+    selection: ChatSelection | None = None
+    continuation: ChatContinuation | None = None
+
+    @model_validator(mode="after")
+    def one_input(self):
+        if sum(value is not None for value in (self.message, self.selection, self.continuation)) != 1:
+            raise ValueError("Supply exactly one chat input")
+        if (self.selection or self.continuation) and (not self.conversationId or self.expectedRevision is None):
+            raise ValueError("Selections require a conversation and revision")
+        return self
 
 
 class Create(Strict):
@@ -120,9 +143,11 @@ class IntentChanges(Strict):
 
 
 class Intent(Strict):
-    kind: Literal["search", "contents", "move", "update", "tags", "location.create", "item.create", "unsupported"]
+    kind: Literal["search", "contents", "move", "update", "tags", "location.create", "item.create", "unsupported",
+                  "inventory.overview", "locations.list", "destinations.list", "collections.list", "draft.edit", "reference"]
     query: str = Field(default="", max_length=500)
     destination: str | None = Field(default=None, max_length=255)
+    destinationKind: Literal["locations", "items"] | None = None
     changes: IntentChanges | None = None
     tags: list[str] = Field(default_factory=list, max_length=30)
     tagsMode: Literal["add", "remove", "replace"] = "add"

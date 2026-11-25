@@ -1,0 +1,17 @@
+# Deliberate API-only outbound access. Never enable this for normal local Ollama.
+# Initialize the isolated provider-key directory even for an anonymous endpoint.
+# Provider/URL/model/key selection is resolved from the shared and role AI_* env.
+services:
+  assistant-api:
+    volumes:
+      - type: bind
+        source: ./secrets/ai
+        target: /run/secrets/ai
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - ai_egress
+
+networks:
+  ai_egress: {}

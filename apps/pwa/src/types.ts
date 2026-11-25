@@ -1,4 +1,14 @@
+export interface AiRole { provider: "ollama" | "openai-compatible" | "anthropic-messages" | "gemini"; model: string }
+export interface PublicAi {
+  chat?: AiRole;
+  vision?: AiRole;
+  // Accept older servers which exposed one shared provider/model.
+  provider?: AiRole["provider"];
+  model?: string;
+}
 export interface Session {
+  ai?: PublicAi;
+  scope?: ChatScope;
   user: { id: string; email: string; name: string };
   collections: { id: string; name: string }[];
   collectionId: string;
@@ -30,6 +40,19 @@ export interface Draft {
   tags: string[];
 }
 export interface Capture { captureId: string; draft: Draft; duplicates: Entity[]; locations: Location[]; warnings: string[] }
+export interface CaptureJob {
+  id: string;
+  status: "queued" | "running" | "succeeded" | "manual" | "failed" | "expired";
+  submissionKey: string;
+  captureId: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  expiresAt: string | null;
+  result: Capture | null;
+  error: { code: string; message: string } | null;
+  warningCodes: string[];
+}
 export type ActionType = "item.create" | "item.move" | "item.update" | "location.create" | "item.tags";
 export interface Action {
   id: string;
@@ -46,6 +69,26 @@ export interface Action {
   error?: string | { code?: string; message?: string } | null;
 }
 export interface Chat { message: string; items: Entity[]; action?: Action; choices?: { kind: string; candidates: Entity[] } }
+export interface ChatScope {
+  instanceId: string; instanceLabel: string; collectionId: string; collectionName: string; contextVersion: string | number;
+}
+export interface ChatCandidate { id: string; entityId: string | null; label: string; path: string; kind: "location" | "item" | "unassigned" }
+export interface ChatDestination { id: string; name: string; path: string; kind: "location" | "item"; parentId?: string | null }
+export interface ChatReply extends Chat {
+  conversationId: string; turnId: string; revision: number;
+  outcome: "answered" | "clarification" | "proposal" | "unsupported";
+  scope: ChatScope;
+  overview?: { itemRecordCount: number; locationCount: number; includeArchived: false; complete: true };
+  destinations?: ChatDestination[];
+  collections?: { id: string; name: string; current: boolean }[];
+  pagination?: { continuationId: string | null; totalRecords: number; page: number; pageSize: number; hasMore: boolean; complete: boolean };
+  clarification?: { id: string; slot: string; reason: "missing" | "not_found" | "ambiguous"; candidates: ChatCandidate[] };
+  pendingOperation?: { id: string; type: ActionType; payload: Record<string, unknown>; destinationQuery?: string; destination?: ChatDestination | null; actionId?: string; captureId?: string; status: string };
+}
+export interface ChatRequest {
+  clientTurnId: string; conversationId?: string; expectedRevision?: number; mode: "normal" | "read_only";
+  message?: string; selection?: { clarificationId: string; candidateId: string }; continuation?: { id: string };
+}
 export interface Mapping {
   tagId: string;
   targetType: "item" | "location";

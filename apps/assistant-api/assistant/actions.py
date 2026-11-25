@@ -19,6 +19,7 @@ class Actions:
         self.config, self.state, self.clients = config, state, clients
 
     def load(self, session, action_id):
+        self.state.require_context(session)
         row = self.state.one(
             "SELECT * FROM actions WHERE id=? AND actor=? AND session=? AND collection=?",
             (action_id, session["actor"], session["id"], session["collection"]),
@@ -27,7 +28,28 @@ class Actions:
             raise ServiceError("not_found", "Action not found in this session and collection.", 404)
         return row, json.loads(row["data"])
 
+    def pending(self, session, db=None):
+        if db is None:
+            with self.state.connect() as connection:
+                return self.pending(session, connection)
+        row = db.execute(
+            "SELECT id,data FROM actions WHERE session=? AND actor=? AND collection=? AND "
+            "(status IN ('proposed','running','uncertain') OR (status='failed' AND "
+            "(json_extract(data,'$.retryable')=1 OR json_extract(data,'$._createdId') IS NOT NULL "
+            "OR json_extract(data,'$.result.id') IS NOT NULL))) ORDER BY rowid DESC LIMIT 1",
+            (session["id"], session["actor"], session["collection"]),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def require_no_pending(self, session, db=None):
+        pending = self.pending(session, db)
+        if pending:
+            raise ServiceError("write_pending", "Recover or cancel the existing review before creating another. This draft and photo were not changed.",
+                               409, {"actionId": pending["id"], "recoveryEndpoint": "/api/assistant/v1/actions"})
+
     async def propose(self, session, request):
+        self.state.require_context(session)
+        read_tool = "get_entity_card" if session.get("_chatTurnId") else "get_entity"
         try:
             payload = PAYLOADS[request.type].model_validate(request.payload).model_dump(mode="json", exclude_none=True)
         except ValidationError as exc:
@@ -37,19 +59,38 @@ class Actions:
             if any(not value.strip() or len(value) > 100 for value in tags):
                 raise ServiceError("invalid_tags", "Each tag must contain 1 to 100 characters.", 422)
             payload["tags"] = list(dict.fromkeys(value.strip() for value in tags))
+        self.require_no_pending(session)
         before = None
-        if "entityId" in payload:
-            before = await self.clients.tool(session, "get_entity", {"entity_id": payload["entityId"]})
-            if before["isLocation"]:
-                raise ServiceError("invalid_item", "This action requires an item, not a location.", 422)
         destination = None
         destination_id = payload.get("locationId") or payload.get("parentId")
-        if destination_id:
-            destination = await self.clients.tool(session, "get_entity", {"entity_id": destination_id})
+        ids = list(dict.fromkeys(filter(None, [payload.get("entityId"), destination_id])))
+        if session.get("_chatTurnId") and ids:
+            if session.get("_chatReads", 0) >= 4:
+                raise ServiceError("chat_read_limit", "Continue this draft in another turn to validate its review.", 409)
+            session["_chatReads"] = session.get("_chatReads", 0) + 1
+            self.state.require_context(session)
+            result = await self.clients.tool(session, "get_entity_cards", {"entity_ids": ids})
+            self.state.require_context(session)
+            cards = {value["id"]: value for value in result["items"]}
+            if set(cards) != set(ids) or len(result["items"]) != len(ids):
+                raise ServiceError("incomplete_inventory_read", "The exact validation cards were incomplete.", 503)
+            before, destination = cards.get(payload.get("entityId")), cards.get(destination_id)
+        else:
+            if "entityId" in payload:
+                before = await self.clients.tool(session, read_tool, {"entity_id": payload["entityId"]})
+            if destination_id:
+                destination = await self.clients.tool(session, read_tool, {"entity_id": destination_id})
+        if before and before["isLocation"]:
+            raise ServiceError("invalid_item", "This action requires an item, not a location.", 422)
         if request.type == "location.create" and destination and not destination["isLocation"]:
             raise ServiceError("invalid_parent", "A location's parent must also be a location.", 422)
         if request.type == "item.move" and payload["entityId"] == destination_id:
             raise ServiceError("invalid_move", "An item cannot contain itself.", 422)
+        if request.type == "item.move" and session.get("_chatTurnId"):
+            if not isinstance(destination.get("ancestorIds"), list):
+                raise ServiceError("destination_path_unavailable", "Refresh the destination before preparing this move.", 503)
+            if payload["entityId"] in destination["ancestorIds"]:
+                raise ServiceError("invalid_move", "An item cannot be moved into its descendants.", 422)
         if request.type == "item.update" and len(payload) < 2:
             raise ServiceError("invalid_action", "Choose at least one field to update.", 422)
         action_id = "a_" + secrets.token_urlsafe(24)
@@ -78,8 +119,12 @@ class Actions:
                       "photoIncluded": bool(request.captureId)},
             "result": None, "error": None, "retryable": False, "_destination": destination,
             "_captureId": request.captureId,
+            "_readTool": read_tool,
         }
         with self.state.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.state.require_context(session, db)
+            self.require_no_pending(session, db)
             if capture:
                 changed = db.execute(
                     "UPDATE captures SET action_id=? WHERE id=? AND action_id IS NULL",
@@ -91,6 +136,9 @@ class Actions:
                 action_id, session["id"], session["actor"], session["collection"], json.dumps(action),
                 "proposed", time.time() + self.config.action_ttl,
             ))
+            if session.get("_chatTurnId"):
+                db.execute("INSERT INTO chat_action_links VALUES(?,?,?)",
+                           (session["_chatTurnId"], session["_chatConversationId"], action_id))
         self.state.audit(session, action, "proposed")
         return public(action)
 
@@ -99,6 +147,7 @@ class Actions:
             return await self._confirm_locked(session, action_id, revision, key)
 
     async def _confirm_locked(self, session, action_id, revision, key):
+        self.state.require_context(session)
         row, action = self.load(session, action_id)
         if revision != action["revision"]:
             raise ServiceError("stale_revision", "The action changed. Review a new confirmation.", 409)
@@ -111,9 +160,11 @@ class Actions:
         if action["status"] == "cancelled" or row["expires"] < time.time():
             raise ServiceError("action_expired", "This action was cancelled or expired. Propose it again.", 409)
         # Claim before asynchronous reads or writes so overlapping confirms cannot execute twice.
-        if not self.state.execute(
-            "UPDATE actions SET status='running' WHERE id=? AND status IN ('proposed','failed')", (action_id,),
-        ):
+        with self.state.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.state.require_context(session, db)
+            claimed = db.execute("UPDATE actions SET status='running' WHERE id=? AND status IN ('proposed','failed')", (action_id,)).rowcount
+        if not claimed:
             _, current = self.load(session, action_id)
             return public(current)
         action["status"], action["_key"], action["error"] = "running", key, None
@@ -124,11 +175,12 @@ class Actions:
             if not action.get("_createdId"):
                 for old in (action["before"], action.get("_destination")):
                     if old:
-                        current = await self.clients.tool(session, "get_entity", {"entity_id": old["id"]})
+                        current = await self.clients.tool(session, action.get("_readTool", "get_entity"), {"entity_id": old["id"]})
                         if current != old:
                             raise ServiceError("stale_action", "An item or destination changed. Review a new action.", 409)
             payload = action["payload"]
             kind = action["type"]
+            self.state.require_context(session)
             self.state.audit(session, action, "confirmed")
             action["_confirmedAt"] = time.time()
             self.state.save_action(action)

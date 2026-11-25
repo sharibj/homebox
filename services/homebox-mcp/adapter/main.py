@@ -16,6 +16,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from .reads import DestinationKind, EntityIDs, Page, PageSize, Query, StrictReadArguments, bounded_reads
+
 
 def secret() -> str:
     value = Path(os.environ["MCP_SHARED_SECRET_FILE"]).read_text().strip()
@@ -38,7 +40,7 @@ class ScopedClient:
 
 upstream._client.close()
 upstream._client = ScopedClient()
-mcp = MCPServer("homebox-companion", version="1.0.0")
+mcp = MCPServer("homebox-companion", version="1.0.0", middleware=[StrictReadArguments()])
 READ = ToolAnnotations(read_only_hint=True)
 
 
@@ -156,6 +158,70 @@ def location_contents(location_id: str) -> dict:
         if (e.get("parent") or {}).get("id") == uid(location_id)
     ]
     return {"items": values, "total": len(values)}
+
+
+@mcp.tool(annotations=READ)
+async def inventory_overview(preview_limit: PageSize = 10) -> dict:
+    """Count non-archived item/location records, including legacy untyped items.
+
+    Counts are records, not quantities. Only the requested 1-20 item preview is
+    hydrated; complete=true certifies that preview and both filtered totals.
+    """
+    async with bounded_reads(current_client.get()) as reads:
+        return await reads.overview(preview_limit)
+
+
+@mcp.tool(annotations=READ)
+async def list_items_page(query: Query = "", location_id: str | None = None,
+                          page: Page = 1, page_size: PageSize = 20) -> dict:
+    """Read one non-archived item page, including legacy untyped items.
+
+    complete=true means this PAGE was validated, not that all matches fit.
+    Always inspect total/hasMore/page/pageSize. An optional exact active location
+    filters effective physical storage; item-container UUIDs are not locations.
+    """
+    async with bounded_reads(current_client.get()) as reads:
+        return await reads.items_page(query, location_id, page, page_size)
+
+
+@mcp.tool(annotations=READ)
+async def list_destinations_page(kind: DestinationKind = "locations", query: Query = "",
+                                 page: Page = 1, page_size: PageSize = 20) -> dict:
+    """Read one non-archived locations (default) or items destination page.
+
+    Items need not already have children. complete=true validates this PAGE,
+    never all matching candidates. Never infer uniqueness unless page=1,
+    returnedCount=total and hasMore=false, across both kinds when unspecified.
+    Exact-ID choices still require fresh authorization and mutation validation.
+    """
+    async with bounded_reads(current_client.get()) as reads:
+        return await reads.destinations_page(kind, query, page, page_size)
+
+
+@mcp.tool(annotations=READ)
+async def get_entity_card(entity_id: str) -> dict:
+    """Read one exact authorized non-archived entity without expanding children.
+
+    ancestorIds are the validated parent-chain UUIDs root-to-parent, excluding
+    self. Missing/unusable ancestry fails instead of suggesting no ancestors.
+    path is the full logical root-to-entity display path; locationPath retains
+    the separate effective physical-location meaning.
+    """
+    async with bounded_reads(current_client.get()) as reads:
+        return await reads.card(await reads.detail(entity_id), include_ancestors=True)
+
+
+@mcp.tool(annotations=READ)
+async def get_entity_cards(entity_ids: EntityIDs) -> dict:
+    """Read one or two distinct non-archived cards with logical path and ancestorIds.
+
+    UUIDs must be distinct after normalization, before any HTTP.
+    Uses one authenticated client/deadline for the ordered batch, at most six
+    GETs and no recursive children. Any inaccessible/incomplete card fails the
+    whole batch; no partial source/destination authorization result is returned.
+    """
+    async with bounded_reads(current_client.get()) as reads:
+        return await reads.cards(entity_ids)
 
 
 class CreateItem(BaseModel):

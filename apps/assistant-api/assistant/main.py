@@ -2,11 +2,10 @@ import asyncio
 import hashlib
 import hmac
 import json
-import re
 import secrets
 import time
 from collections import defaultdict, deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -18,13 +17,60 @@ from pydantic import ValidationError
 
 from .actions import Actions, public
 from .clients import Clients, ServiceError
+from .capture_jobs import CaptureJobs, MODEL_LOCK, draft_result
 from .config import Config
+from .conversations import Conversations
 from .images import VisionClient, normalize
-from .schemas import ActionRequest, Collection, Confirm, Intent, Login, MappingCreate, MappingUpdate, Message
+from .schemas import ActionRequest, Collection, Confirm, Login, MappingCreate, MappingUpdate, Message
 from .state import State
 
 PREFIX = "/api/assistant/v1"
 COOKIE = "hb_assistant"
+LEGACY_REQUEST_TIMEOUT = 150
+
+
+class CaptureDeadline:
+    """Cancel the entire legacy ASGI request, including middleware child tasks."""
+    def __init__(self, app, chat_timeout=60):
+        self.app = app
+        self.chat_timeout = chat_timeout
+
+    async def __call__(self, scope, receive, send):
+        legacy = scope["type"] == "http" and scope["method"] == "POST" and scope["path"] == PREFIX + "/captures"
+        chat = scope["type"] == "http" and scope["method"] == "POST" and scope["path"] == PREFIX + "/chat"
+        if not legacy and not chat:
+            return await self.app(scope, receive, send)
+        started = False
+
+        async def track_send(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            async with asyncio.timeout(LEGACY_REQUEST_TIMEOUT if legacy else self.chat_timeout):
+                await self.app(scope, receive, track_send)
+        except TimeoutError:
+            if started:
+                return
+            retained = scope.get("state", {}).get("legacy_capture_id")
+            if chat:
+                response = JSONResponse({"error": {"code": "chat_timed_out",
+                                                    "message": "This turn reached its time limit. Recover the conversation before retrying."}},
+                                        status_code=503)
+            elif retained:
+                response = JSONResponse(draft_result(
+                    retained, warning="Photo preparation or analysis reached its request time limit. Your photo is retained; enter the details manually.",
+                ))
+            else:
+                response = JSONResponse({"error": {
+                    "code": "capture_request_timed_out",
+                    "message": "Photo preparation reached its request time limit. No inventory change was made.",
+                }}, status_code=504)
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            await response(scope, receive, send)
 
 
 def create_app(config=None, clients=None):
@@ -34,10 +80,13 @@ def create_app(config=None, clients=None):
     services = clients or Clients(cfg)
     actions = Actions(cfg, state, services)
     vision = VisionClient(cfg)
+    jobs = CaptureJobs(cfg, state, services, vision)
+    conversations = Conversations(cfg, state, services, actions, vision)
     limits = defaultdict(deque)
 
     def cleanup():
         now = time.time()
+        jobs.refresh()
         for capture in state.all(
             "SELECT c.* FROM captures c LEFT JOIN actions a ON c.action_id=a.id "
             "WHERE c.expires<? AND (a.id IS NULL OR a.status NOT IN ('running','failed'))", (now,),
@@ -45,15 +94,29 @@ def create_app(config=None, clients=None):
             (cfg.uploads / capture["filename"]).unlink(missing_ok=True)
             state.execute("DELETE FROM captures WHERE id=?", (capture["id"],))
         state.execute("DELETE FROM sessions WHERE expires<?", (now,))
+        conversations.cleanup()
 
     @asynccontextmanager
     async def lifespan(app):
         cleanup()
-        yield
+        worker = asyncio.create_task(jobs.run())
+        chat_cleanup = asyncio.create_task(conversations.run_cleanup())
+        try:
+            yield
+        finally:
+            worker.cancel()
+            chat_cleanup.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker
+            with suppress(asyncio.CancelledError):
+                await chat_cleanup
+            await vision.aclose()
 
     app = FastAPI(title="Homebox Companion", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.config, app.state.store, app.state.clients = cfg, state, services
     app.state.actions, app.state.vision = actions, vision
+    app.state.capture_jobs = jobs
+    app.state.conversations = conversations
 
     def rate(request, bucket, maximum, window=60, actor=None):
         now = time.monotonic()
@@ -71,6 +134,7 @@ def create_app(config=None, clients=None):
 
     @app.middleware("http")
     async def boundary(request: Request, call_next):
+        request.state.started_at = time.monotonic()
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             if request.headers.get("origin") != cfg.origin:
                 return JSONResponse({"error": {"code": "origin_denied", "message": "A same-origin request is required."}}, 403)
@@ -93,6 +157,8 @@ def create_app(config=None, clients=None):
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
+
+    app.add_middleware(CaptureDeadline, chat_timeout=cfg.chat_timeout)
 
     @app.exception_handler(ServiceError)
     async def service_error(request, exc):
@@ -129,15 +195,27 @@ def create_app(config=None, clients=None):
                     "The selected collection changed in another tab. Reload the session before continuing.",
                     409, {"sessionEndpoint": PREFIX + "/session"},
                 )
+        context = state.chat_context(row)
+        supplied_version = request.headers.get("x-context-version")
+        if supplied_version is not None and supplied_version != context["version"]:
+            raise ServiceError("COLLECTION_CONTEXT_CHANGED", "The session context changed. Reload the session.", 409)
+        row["_contextVersion"] = context["version"]
         return row
 
     async def session_response(value):
         groups = await services.homebox("GET", "/groups/all", {**value, "collection": ""})
         user = value["user"]
+        context = state.chat_context(value)
+        selected = next((g for g in groups if g["id"] == value["collection"]), None)
         return {
             "user": {k: user.get(k, "") for k in ("id", "name", "email")},
             "collections": [{"id": g["id"], "name": g["name"]} for g in groups],
             "collectionId": value["collection"], "csrfToken": value["csrf"],
+            "scope": {"instanceId": cfg.instance_id, "instanceLabel": cfg.instance_label or "Homebox " + cfg.instance_id[:8],
+                      "collectionId": value["collection"], "collectionName": selected["name"] if selected else "Unavailable collection",
+                      "contextVersion": context["version"]},
+            "ai": {"chat": {"provider": cfg.chat_provider_settings.kind, "model": cfg.chat_provider_settings.model},
+                   "vision": {"provider": cfg.vision_provider_settings.kind, "model": cfg.vision_provider_settings.model}},
         }
 
     @app.get("/healthz")
@@ -177,7 +255,7 @@ def create_app(config=None, clients=None):
             sid, cfg.cipher.encrypt(token["token"].encode()).decode(),
             user["id"], temporary["collection"], csrf, time.time() + ttl,
         ))
-        temporary["csrf"] = csrf
+        temporary["csrf"], temporary["id"] = csrf, sid
         response = JSONResponse(await session_response(temporary))
         response.set_cookie(COOKIE, raw, max_age=ttl, path=PREFIX, secure=cfg.secure,
                             httponly=True, samesite="strict")
@@ -193,6 +271,8 @@ def create_app(config=None, clients=None):
         existing = state.one("SELECT * FROM sessions WHERE id=?", (hashlib.sha256(raw.encode()).hexdigest(),))
         if existing:
             s = local_session(request, allow_expired=True)
+            state.execute("UPDATE conversations SET expires=0 WHERE session=?", (s["id"],))
+            state.execute("DELETE FROM chat_contexts WHERE session=?", (s["id"],))
             state.execute("DELETE FROM sessions WHERE id=?", (s["id"],))
 
             async def revoke():
@@ -210,9 +290,16 @@ def create_app(config=None, clients=None):
         group = str(body.collectionId)
         if group not in s["user"]["groupIds"]:
             raise ServiceError("collection_denied", "You do not have access to this collection.", 403)
+        await services.homebox("GET", "/groups", {**s, "collection": group})
+        with state.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            state.require_context(s, db)
+            db.execute("UPDATE sessions SET collection=? WHERE id=?", (group, s["id"]))
+            db.execute("INSERT INTO chat_contexts VALUES(?,?,?,NULL) ON CONFLICT(session) DO UPDATE SET "
+                       "collection=excluded.collection,version=excluded.version,conversation_id=NULL",
+                       (s["id"], group, secrets.token_urlsafe(24)))
+            db.execute("UPDATE conversations SET expires=0 WHERE session=?", (s["id"],))
         s["collection"] = group
-        await services.homebox("GET", "/groups", s)
-        state.execute("UPDATE sessions SET collection=? WHERE id=?", (group, s["id"]))
         return await session_response(s)
 
     @app.get(PREFIX + "/locations")
@@ -272,133 +359,92 @@ def create_app(config=None, clients=None):
         state.audit(s, action, "cancelled")
         return public(action)
 
+    async def read_photo(image, hint, location_id, s):
+        if len(hint) > 500:
+            raise ServiceError("hint_too_long", "Keep the photo hint to 500 characters.", 422)
+        if location_id:
+            try:
+                location_id = str(UUID(location_id))
+            except ValueError:
+                raise ServiceError("invalid_location", "Choose a valid location.", 422)
+            await services.tool(s, "get_entity", {"entity_id": location_id})
+        try:
+            data = await image.read(cfg.max_upload + 1)
+        finally:
+            await image.close()
+        if len(data) > cfg.max_upload:
+            raise ServiceError("image_too_large", "The image exceeds the upload limit.", 413)
+        normalized = await asyncio.to_thread(normalize, data, cfg)
+        return normalized, location_id
+
+    @app.post(PREFIX + "/capture-jobs")
+    async def submit_capture_job(request: Request, image: UploadFile = File(...), hint: str = Form(""),
+                                 locationId: str | None = Form(None), s=Depends(session)):
+        key = request.headers.get("idempotency-key", "")
+        if not 8 <= len(key) <= 128:
+            raise ServiceError("idempotency_key_required", "Supply a stable retry key of 8 to 128 characters.", 400)
+        cleanup()
+        if not state.one("SELECT id FROM capture_jobs WHERE session=? AND submission_key=?", (s["id"], key)):
+            rate(request, "capture", 4, 60, s["actor"])
+        normalized, location_id = await read_photo(image, hint, locationId, s)
+        row = jobs.submit(s, key, normalized, hint, location_id)
+        return JSONResponse(jobs.public(row), status_code=202)
+
+    @app.get(PREFIX + "/capture-jobs")
+    async def recover_capture_jobs(submissionKey: str | None = None, s=Depends(session)):
+        jobs.refresh()
+        query = "SELECT * FROM capture_jobs WHERE actor=? AND session=? AND collection=? AND instance=?"
+        args = [s["actor"], s["id"], s["collection"], cfg.instance_id]
+        if submissionKey is not None:
+            if not 8 <= len(submissionKey) <= 128:
+                raise ServiceError("invalid_submission_key", "Supply a valid photo submission key.", 422)
+            query += " AND submission_key=?"
+            args.append(submissionKey)
+        return {"jobs": [jobs.public(row) for row in state.all(query + " ORDER BY created DESC,rowid DESC LIMIT 20", args)]}
+
+    @app.get(PREFIX + "/capture-jobs/{job_id}")
+    async def get_capture_job(job_id: str, s=Depends(session)):
+        jobs.refresh()
+        return jobs.public(jobs.load(s, job_id))
+
     @app.post(PREFIX + "/captures")
     async def capture(request: Request, image: UploadFile = File(...), hint: str = Form(""),
                       locationId: str | None = Form(None), s=Depends(session)):
         rate(request, "capture", 4, 60, s["actor"])
         cleanup()
-        if locationId:
-            try:
-                locationId = str(UUID(locationId))
-            except ValueError:
-                raise ServiceError("invalid_location", "Choose a valid location.", 422)
-            await services.tool(s, "get_entity", {"entity_id": locationId})
-        data = await image.read(cfg.max_upload + 1)
-        await image.close()
-        if len(data) > cfg.max_upload:
-            raise ServiceError("image_too_large", "The image exceeds the upload limit.", 413)
-        normalized = await asyncio.to_thread(normalize, data, cfg)
-        warning = None
+        normalized, _ = await read_photo(image, hint, locationId, s)
+        capture_id, filename = jobs.persist_photo(s, normalized)
         try:
-            answer = await vision.analyze(normalized, hint)
-            item = answer.items[0]
+            state.execute("INSERT INTO captures VALUES(?,?,?,?,?,NULL)",
+                          (capture_id, s["id"], s["collection"], filename, time.time() + cfg.capture_ttl))
+            request.state.legacy_capture_id = capture_id
+        except BaseException:
+            (cfg.uploads / filename).unlink(missing_ok=True)
+            raise
+        remaining = max(0, cfg.capture_sync_timeout - (time.monotonic() - request.state.started_at))
+        try:
+            async with asyncio.timeout(remaining):
+                async with state.collection_lock(MODEL_LOCK):
+                    return await jobs.analyze_photo(s, capture_id, normalized, hint)
+        except TimeoutError:
+            return draft_result(capture_id, warning="Photo analysis reached the synchronous request time limit. Your photo is retained; enter the details manually.")
         except ServiceError as exc:
-            if exc.code not in {"model_unavailable", "invalid_model_output"}:
+            if exc.status in {401, 403, 409}:
                 raise
-            item, answer, warning = None, None, exc.message
-        capture_id = "c_" + secrets.token_urlsafe(24)
-        filename = capture_id + ".jpg"
-        path = cfg.uploads / filename
-        path.write_bytes(normalized)
-        path.chmod(0o600)
-        state.execute("INSERT INTO captures VALUES(?,?,?,?,?,NULL)",
-                      (capture_id, s["id"], s["collection"], filename, time.time() + cfg.capture_ttl))
-        warnings = [warning] if warning else ["Model output is a draft. Check every field before saving."]
-        if item and item.confidence < .6:
-            warnings.append("The model is uncertain about this identification.")
-        if answer and len(answer.items) > 1:
-            warnings.append("Several objects were detected. This draft contains only the first; photograph the others separately.")
-        duplicates = await services.tool(s, "search_items", {"query": item.model or item.name}) if item else {"items": []}
-        location_list = await services.tool(s, "list_locations")
-        return {
-            "captureId": capture_id,
-            "draft": {"name": item.name if item else "", "category": item.category if item else None,
-                      "manufacturer": (item.manufacturer or "") if item else "",
-                      "model": (item.model or "") if item else "", "serialNumber": (item.serialNumber or "") if item else "",
-                      "quantity": item.quantity_estimate if item else 1, "notes": answer.image_notes if answer else "",
-                      "tags": item.suggested_tags if item else []},
-            "duplicates": duplicates["items"], "locations": location_list["locations"], "warnings": warnings,
-        }
+            return draft_result(capture_id, warning=exc.message)
 
     @app.post(PREFIX + "/chat")
     async def chat(body: Message, request: Request, s=Depends(session)):
         rate(request, "chat", 20, 60, s["actor"])
-        text = body.message.strip().rstrip(".?!")
-        move = re.fullmatch(r"(?:i\s+(?:moved|put)|move)\s+(?:the\s+)?(.+?)\s+(?:into|to|in)\s+(?:the\s+)?(.+)", text, re.I)
-        contents = re.fullmatch(r"(?:what(?:'s| is)|show (?:me )?what(?:'s| is))\s+in\s+(?:the\s+)?(.+)", text, re.I)
-        search = re.match(r"^(?:where (?:is|are)|find|search for|look for)\s+(?:(?:my|the)\s+)?", text, re.I)
-        if move:
-            intent = Intent(kind="move", query=move[1], destination=move[2])
-        elif contents:
-            intent = Intent(kind="contents", query=contents[1])
-        elif search:
-            intent = Intent(kind="search", query=text[search.end():])
-        else:
-            try:
-                intent = await vision.intent(text)
-            except ServiceError as exc:
-                result = await services.tool(s, "search_items", {"query": text[:500]})
-                return {"message": exc.message, "items": result["items"]}
+        return await conversations.handle(s, body)
 
-        def matches(value, query):
-            def normalized(text):
-                return re.sub(r"\s*/\s*", "/", text.strip()).casefold()
-            return normalized(query) in {
-                normalized(value.get("name", "")), normalized(value.get("path", "")),
-                normalized(" / ".join(filter(None, [value.get("locationPath"), value.get("name")]))),
-            }
+    @app.get(PREFIX + "/conversations/current")
+    async def current_conversation(s=Depends(session)):
+        return await conversations.current(s)
 
-        async def destinations(query):
-            locations = (await services.tool(s, "list_locations"))["locations"]
-            choices = [value for value in locations if matches(value, query)]
-            containers = (await services.tool(s, "search_items", {"query": query.split("/")[-1].strip()}))["items"]
-            choices += [value for value in containers if matches(value, query)]
-            return choices
-
-        if intent.kind == "unsupported":
-            return {"message": "I can search, show contents, or propose reviewed inventory changes. Deletion and merging are not available in chat.", "items": []}
-        if intent.kind == "contents":
-            choices = await destinations(intent.query)
-            if len(choices) == 1:
-                result = await services.tool(s, "location_contents", {"location_id": choices[0]["id"]})
-                return {"message": f"{choices[0].get('path', choices[0]['name'])}: {result['total']} item(s).", "items": result["items"]}
-            return {"message": "Choose the location you mean.", "items": [],
-                    "choices": {"kind": "location", "candidates": choices}}
-        if intent.kind == "search":
-            result = await services.tool(s, "search_items", {"query": intent.query})
-            message = "No matching inventory records." if not result["items"] else "\n".join(
-                f"{v['name']} — {v['locationPath'] or 'No location assigned'}" for v in result["items"][:10]
-            )
-            return {"message": message, "items": result["items"]}
-
-        selected = []
-        if intent.kind in {"move", "update", "tags"}:
-            found = (await services.tool(s, "search_items", {"query": intent.query.split("/")[-1].strip()}))["items"]
-            selected = [value for value in found if matches(value, intent.query)]
-            if len(selected) != 1:
-                return {"message": "Choose the exact item before making a change.", "items": found,
-                        "choices": {"kind": "item", "candidates": found}}
-        payload = {"entityId": selected[0]["id"]} if selected else {}
-        if intent.kind == "move" or intent.destination:
-            choices = await destinations(intent.destination or "")
-            if len(choices) != 1:
-                return {"message": "Choose an unambiguous destination before making a change.", "items": selected,
-                        "choices": {"kind": "destination", "candidates": choices}}
-            payload["parentId" if intent.kind == "location.create" else "locationId"] = choices[0]["id"]
-        kind = {"move": "item.move", "update": "item.update", "tags": "item.tags"}.get(intent.kind, intent.kind)
-        if intent.kind in {"item.create", "location.create"}:
-            payload["name"] = intent.query
-        if intent.kind in {"update", "item.create"} and intent.changes:
-            payload.update(intent.changes.model_dump(exclude_none=True))
-        if intent.kind == "tags":
-            existing = selected[0].get("tags", [])
-            payload["tags"] = (
-                list(dict.fromkeys(existing + intent.tags)) if intent.tagsMode == "add"
-                else [tag for tag in existing if tag not in intent.tags] if intent.tagsMode == "remove"
-                else intent.tags
-            )
-        action = await actions.propose(s, ActionRequest(type=kind, payload=payload))
-        return {"message": "Review this proposed change. Nothing has changed yet.", "items": selected, "action": action}
+    @app.post(PREFIX + "/conversations/reset")
+    async def reset_conversation(s=Depends(session)):
+        return await conversations.reset(s)
 
     def mapping_row(tag_id, s):
         row = state.one("SELECT * FROM mappings WHERE id=? AND collection=?", (tag_id, s["collection"]))

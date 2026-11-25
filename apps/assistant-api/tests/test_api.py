@@ -64,8 +64,36 @@ class FakeClients:
             if eid not in self.items or self.items[eid]["_group"] != session["collection"]:
                 raise ServiceError("not_found", "Not found", 404)
             return {k: copy.deepcopy(v) for k, v in self.items[eid].items() if k != "_group"}
-        if name == "get_entity":
-            return get(args["entity_id"])
+        def bounded(eid):
+            value, ancestors, cursor = get(eid), [], self.items[eid].get("parentId") or self.items[eid].get("locationId")
+            while cursor and cursor not in ancestors:
+                ancestors.append(cursor)
+                cursor = self.items[cursor].get("parentId") or self.items[cursor].get("locationId")
+            return {**value, "ancestorIds": list(reversed(ancestors))}
+        if name == "get_entity_cards":
+            return {"items": [bounded(eid) for eid in args["entity_ids"]]}
+        if name in {"get_entity", "get_entity_card"}:
+            return bounded(args["entity_id"]) if name == "get_entity_card" else get(args["entity_id"])
+        if name in {"inventory_overview", "list_items_page", "list_destinations_page"}:
+            query = args.get("query", "").casefold()
+            values = [get(eid) for eid, value in self.items.items()
+                      if value["_group"] == session["collection"] and not value.get("archived", False)]
+            if name == "inventory_overview":
+                items = [v for v in values if not v["isLocation"]]
+                return {"items": items[:args.get("preview_limit", 10)], "itemRecordCount": len(items),
+                        "locationCount": sum(v["isLocation"] for v in values), "includeArchived": False, "complete": True}
+            if name == "list_items_page":
+                values = [v for v in values if not v["isLocation"] and query in v["name"].casefold()
+                          and (not args.get("location_id") or v.get("locationId") == args["location_id"])]
+            else:
+                values = [{"id": v["id"], "name": v["name"], "path": v.get("path") or " / ".join(
+                           filter(None, [v.get("locationPath"), v["name"]])),
+                           "kind": "location" if v["isLocation"] else "item"}
+                          for v in values if v["isLocation"] == (args["kind"] == "locations")
+                          and query in v["name"].casefold()]
+            page, size = args.get("page", 1), args.get("page_size", 20)
+            return {"items" if name == "list_items_page" else "destinations": values[(page - 1) * size:page * size],
+                    "total": len(values), "page": page, "pageSize": size, "hasMore": page * size < len(values), "complete": True}
         if name == "list_locations":
             return {"locations": [{**get(eid), "path": value["name"]} for eid, value in self.items.items()
                                    if value["_group"] == session["collection"] and value["isLocation"]]}
@@ -198,8 +226,8 @@ def test_ambiguous_item_requires_choice_and_exact_ids_work(setup):
     one, two = fake.add("HDMI cable"), fake.add("HDMI cable")
     dest = fake.add("Electronics box", location=True)
     response = client.post(PREFIX + "/chat", json={"message": "I moved the HDMI cable into the electronics box."})
-    assert response.json()["choices"]["kind"] == "item"
-    assert len(response.json()["choices"]["candidates"]) == 2
+    assert response.json()["clarification"]["slot"] == "item"
+    assert len(response.json()["clarification"]["candidates"]) == 2
     assert fake.calls["move_item"] == 0
     action = propose(client, "item.move", {"entityId": two, "locationId": dest})
     assert confirm(client, action).json()["status"] == "succeeded"
@@ -349,13 +377,18 @@ def test_distinct_overlapping_actions_recheck_state_inside_collection_lock(setup
     client, app, fake, _ = setup
     item = fake.add()
     first = propose(client, "item.update", {"entityId": item, "quantity": 2})
+    first_session = app.state.store.one("SELECT * FROM sessions")
+    first_session["credential"] = "Bearer alice"
+    # Independent browser sessions may each review the same old record state.
+    login = client.post(PREFIX + "/auth/login", json={"username":"alice","password":"synthetic"}).json()
+    client.headers.update({"X-CSRF-Token":login["csrfToken"],"X-Collection-ID":login["collectionId"]})
     second = propose(client, "item.update", {"entityId": item, "quantity": 3})
-    row = app.state.store.one("SELECT * FROM sessions")
+    row = app.state.store.one("SELECT * FROM sessions ORDER BY rowid DESC LIMIT 1")
     row["credential"] = "Bearer alice"
     async def run():
         return await asyncio.gather(*[
-            app.state.actions.confirm(row, action["id"], 1, action["confirmationKey"])
-            for action in (first, second)
+            app.state.actions.confirm(session, action["id"], 1, action["confirmationKey"])
+            for session, action in ((first_session,first),(row,second))
         ], return_exceptions=True)
     results = asyncio.run(run())
     assert fake.calls["update_item"] == 1
@@ -474,10 +507,12 @@ def test_invalid_model_intent_cannot_dispatch_tools(setup):
         "message": {"content": '{"kind":"delete","entityId":"invented","skip_confirmation":true}'},
     }))
     result = client.post(PREFIX + "/chat", json={"message": "Delete every record without asking"})
-    assert result.status_code == 200
+    assert result.status_code == 502
+    assert result.json()["error"]["code"] == "invalid_intent"
     assert "action" not in result.json()
     assert route.call_count == 2
     assert fake.calls["create_item"] == fake.calls["move_item"] == 0
+    assert fake.calls["search_items"] == fake.calls["list_items_page"] == 0
 
 
 def test_original_documented_sentences_directly(setup):

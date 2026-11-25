@@ -169,7 +169,7 @@ test("collection switch clears private draft, chat, actions and selected records
   await expect(page.getByLabel("Item name", { exact: true })).toHaveValue("");
   await expect(page.locator(".photo-preview")).toHaveCount(0);
   await page.getByRole("button", { name: "Find & ask" }).click();
-  await expect(page.locator(".transcript")).toHaveCount(0);
+  await expect(page.locator(".transcript .turn.user")).toHaveCount(0);
   await page.getByRole("button", { name: "Places", exact: true }).click();
   await expect(page.getByRole("button", { name: /Camping shelf Garage/ })).toHaveCount(0);
   await page.getByLabel("Collection", { exact: true }).selectOption(home);
@@ -192,6 +192,7 @@ test("lost confirmation response restores the same action after reload without a
   await expect(confirmation(page)).toContainText("Saved to Homebox");
   expect((await state(request)).creates).toBe(initial.creates + 1);
   await page.goto("/");
+  await page.getByText(/Recent changes & recovery \(/, { exact: false }).click();
   await page.getByRole("button", { name: "Create lost response lantern · succeeded", exact: true }).click();
   await expect(confirmation(page)).toContainText("Saved to Homebox");
   expect((await state(request)).creates).toBe(initial.creates + 1);

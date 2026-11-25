@@ -39,7 +39,7 @@ test("real production nginx + source Homebox: offline photo, reviewed create, se
   test.skip(!credentials, "Requires protected disposable acceptance credentials, never a real inventory.");
   const pageErrors = []; page.on("pageerror", error => pageErrors.push(error.message));
   await signIn(page, credentials.users[0]);
-  expect(await page.locator("script[src]").getAttribute("src")).toContain("index-BgA1FbF3.js");
+  expect(await page.locator("script[src]").getAttribute("src")).toMatch(/\/assets\/index-.*\.js$/);
   const run = Date.now().toString(36);
   const first = `Browser shelf ${run}`;
   const second = `Browser box ${run}`;

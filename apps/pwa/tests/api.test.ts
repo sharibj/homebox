@@ -1,7 +1,22 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, createApi } from "../src/api";
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 describe("private API boundary", () => {
+  it("sends the rendered context version even after returning to the same collection", async () => {
+    const fetcher = vi.fn().mockImplementation(async () => Response.json({ ok: true }));
+    vi.stubGlobal("fetch", fetcher);
+    let version = "A-1";
+    const api = createApi(() => "csrf", () => version, () => "A", () => version);
+    await api("/chat", { method: "POST", body: { message: "Overview" } });
+    version = "A-3"; await api("/items");
+    expect(fetcher.mock.calls[0][1].headers.get("X-Context-Version")).toBe("A-1");
+    expect(fetcher.mock.calls[1][1].headers.get("X-Context-Version")).toBe("A-3");
+  });
+  it("does not use a confirmed-change warning for an interrupted chat read", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed")));
+    await expect(createApi(() => "csrf")("/chat", { method: "POST", body: { message: "Show inventory", mode: "read_only" } }))
+      .rejects.toMatchObject({ code: "chat_connection_lost", message: expect.not.stringContaining("If you confirmed") });
+  });
   it("binds every tenant request and collection switch to the displayed collection", async () => {
     const fetcher = vi.fn().mockImplementation(async () => Response.json({ ok: true }));
     vi.stubGlobal("fetch", fetcher);
@@ -61,6 +76,30 @@ describe("private API boundary", () => {
   it("reports interrupted writes without suggesting blind retries", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
     await expect(createApi(() => "token")("/actions/id/confirm", { method: "POST", body: {} })).rejects.toThrow("check its status");
+  });
+  it("gives a photo-specific timeout without implying an inventory confirmation", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new DOMException("Timed out", "TimeoutError")));
+    await expect(createApi(() => "token")("/capture-jobs", { method: "POST", body: new FormData() }))
+      .rejects.toMatchObject({ code: "capture_timeout", message: expect.stringContaining("No inventory item was created") });
+  });
+  it("keeps a photo upload connection loss distinct from a confirmed write", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
+    await expect(createApi(() => "token")("/capture-jobs", { method: "POST", body: new FormData() }))
+      .rejects.toMatchObject({ code: "capture_connection_lost", message: expect.not.stringContaining("If you confirmed") });
+  });
+  it("allows short status requests without extending confirmation deadlines", async () => {
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => new AbortController().signal);
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => Response.json({ ok: true })));
+    const api = createApi(() => "token");
+    await api("/capture-jobs/opaque", { timeoutMs: 15_000 });
+    await api("/actions/opaque/confirm", { method: "POST", body: {} });
+    expect(timeout.mock.calls).toEqual([[15_000], [180_000]]);
+  });
+  it("distinguishes a deliberately cancelled old-context poll", async () => {
+    const controller = new AbortController(); controller.abort();
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new DOMException("Aborted", "AbortError")));
+    await expect(createApi(() => "token")("/capture-jobs/old", { signal: controller.signal }))
+      .rejects.toMatchObject({ code: "request_cancelled" });
   });
   it("does not accept proxy HTML as a successful JSON response", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("<html>offline</html>", { status: 200 })));

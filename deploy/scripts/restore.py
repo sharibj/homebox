@@ -11,6 +11,10 @@ import uuid
 ROOT = Path("/restore")
 VOLUME_ROOTS = {"homebox", "assistant", "proxy-data", "proxy-config"}
 CONFIG_FILES = {"config.env", "docker-compose.yml", "Caddyfile"}
+OPTIONAL_CONFIG_FILES = {
+    "docker-compose.external-ai.yml", "docker-compose.external-ai-key.yml", "deployment-options.env",
+    "docker-compose.lan.yml", "Caddyfile.lan",
+}
 HOST_UID = int(os.environ["RESTORE_UID"])
 HOST_GID = int(os.environ["RESTORE_GID"])
 
@@ -22,7 +26,7 @@ def destination(member):
     top = path.parts[0]
     if top in VOLUME_ROOTS or top == "secrets":
         return ROOT.joinpath(*path.parts), top
-    if len(path.parts) == 1 and top in CONFIG_FILES and member.isfile():
+    if len(path.parts) == 1 and top in CONFIG_FILES | OPTIONAL_CONFIG_FILES and member.isfile():
         return ROOT / "config" / top, "config"
     raise ValueError("Unexpected archive member")
 

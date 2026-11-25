@@ -5,7 +5,6 @@ from uuid import uuid4
 import httpx
 import pytest
 import respx
-from starlette.testclient import TestClient
 
 Path("/tmp/mcp-test-secret").write_text("test-only-mcp-secret-with-32-bytes-minimum")
 os.environ["MCP_SHARED_SECRET_FILE"] = "/tmp/mcp-test-secret"
@@ -14,10 +13,9 @@ os.environ["HOMEBOX_URL"] = "http://homebox:7745"
 from adapter import main as a
 
 
-def test_mcp_rejects_missing_service_auth():
-    with TestClient(a.app) as client:
-        assert client.post("/mcp", json={}).status_code == 401
-        assert client.get("/healthz").status_code == 200
+def test_mcp_rejects_missing_service_auth(mcp_client):
+    assert mcp_client.post("/mcp", json={}).status_code == 401
+    assert mcp_client.get("/healthz").status_code == 200
 
 
 @respx.mock

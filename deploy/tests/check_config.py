@@ -46,6 +46,25 @@ class DeploymentContract(unittest.TestCase):
             self.assertTrue(any(v["type"] == "volume" for v in services[name]["volumes"]), name)
         self.assertEqual(services["ollama"]["environment"]["OLLAMA_NUM_PARALLEL"], "1")
         self.assertEqual(services["ollama"]["environment"]["OLLAMA_MAX_LOADED_MODELS"], "1")
+        api = services["assistant-api"]["environment"]
+        self.assertEqual(api["AI_PROVIDER"], "ollama")
+        self.assertEqual(api["AI_BASE_URL"], "")
+        self.assertEqual(api["AI_MODEL"], "")
+        self.assertEqual(api["AI_CHAT_MODEL"], "")
+        self.assertEqual(api["AI_VISION_MODEL"], "")
+        self.assertEqual(api["AI_API_KEY_FILE"], "")
+        for role in ("CHAT", "VISION"):
+            self.assertEqual(api[f"AI_{role}_PROVIDER"], "")
+            self.assertEqual(api[f"AI_{role}_BASE_URL"], "")
+            self.assertEqual(api[f"AI_{role}_API_KEY_FILE"], "")
+        self.assertNotIn("ai_api_key", CONFIG["secrets"])
+        self.assertEqual(int(api["ASSISTANT_ANALYSIS_QUEUE_LIMIT"]), 8)
+        self.assertEqual(int(api["ASSISTANT_ANALYSIS_QUEUE_TIMEOUT_SECONDS"]), 120)
+        self.assertEqual(int(api["ASSISTANT_ANALYSIS_TIMEOUT_SECONDS"]), 900)
+        self.assertEqual(int(api["ASSISTANT_CAPTURE_SYNC_TIMEOUT_SECONDS"]), 90)
+        self.assertGreater(int(api["ASSISTANT_CAPTURE_TTL_SECONDS"]),
+                           int(api["ASSISTANT_ANALYSIS_QUEUE_TIMEOUT_SECONDS"]) +
+                           int(api["ASSISTANT_ANALYSIS_TIMEOUT_SECONDS"]))
 
     def test_resource_and_image_limits(self):
         total = sum(int(service["mem_limit"]) for service in CONFIG["services"].values())
@@ -58,6 +77,12 @@ class DeploymentContract(unittest.TestCase):
             self.assertNotIn(":latest", image)
             if "build" not in service:
                 self.assertIn("@sha256:", image)
+
+    def test_conversation_defaults(self):
+        api = CONFIG["services"]["assistant-api"]["environment"]
+        self.assertEqual(int(api["ASSISTANT_CHAT_TURN_TIMEOUT_SECONDS"]), 60)
+        self.assertEqual(int(api["ASSISTANT_CONVERSATION_TTL_SECONDS"]), 1800)
+        self.assertEqual(api["ASSISTANT_INSTANCE_LABEL"], "")
 
 
 unittest.main(argv=["check_config.py"])

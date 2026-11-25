@@ -26,6 +26,7 @@ services:
       HOMEBOX_HOST: ${HOMEBOX_HOST:?Set HOMEBOX_HOST in deploy/.env}
       ASSISTANT_HOST: ${ASSISTANT_HOST:?Set ASSISTANT_HOST in deploy/.env}
       TLS_ISSUER: ${TLS_ISSUER:-internal}
+      CADDY_DEFAULT_SNI: ${ASSISTANT_HOST}
     ports:
       - "${PROXY_BIND_IP:-127.0.0.1}:80:80/tcp"
       - "${PROXY_BIND_IP:-127.0.0.1}:443:443/tcp"
@@ -103,6 +104,18 @@ services:
       ASSISTANT_MCP_URL: http://homebox-mcp:8001/mcp
       OLLAMA_URL: http://ollama:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3-vl:2b}
+      AI_PROVIDER: ${AI_PROVIDER:-ollama}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_MODEL: ${AI_MODEL:-}
+      AI_API_KEY_FILE: ${AI_API_KEY_FILE:-}
+      AI_CHAT_PROVIDER: ${AI_CHAT_PROVIDER:-}
+      AI_CHAT_BASE_URL: ${AI_CHAT_BASE_URL:-}
+      AI_CHAT_MODEL: ${AI_CHAT_MODEL:-}
+      AI_CHAT_API_KEY_FILE: ${AI_CHAT_API_KEY_FILE:-}
+      AI_VISION_PROVIDER: ${AI_VISION_PROVIDER:-}
+      AI_VISION_BASE_URL: ${AI_VISION_BASE_URL:-}
+      AI_VISION_MODEL: ${AI_VISION_MODEL:-}
+      AI_VISION_API_KEY_FILE: ${AI_VISION_API_KEY_FILE:-}
       ASSISTANT_PUBLIC_ORIGIN: https://${ASSISTANT_HOST}
       HOMEBOX_PUBLIC_ORIGIN: https://${HOMEBOX_HOST}
       ASSISTANT_STATE_PATH: /data/assistant.db
@@ -116,6 +129,13 @@ services:
       ASSISTANT_SESSION_TTL_SECONDS: "28800"
       ASSISTANT_ACTION_TTL_SECONDS: "900"
       ASSISTANT_CAPTURE_TTL_SECONDS: "3600"
+      ASSISTANT_ANALYSIS_QUEUE_LIMIT: ${ASSISTANT_ANALYSIS_QUEUE_LIMIT:-8}
+      ASSISTANT_ANALYSIS_QUEUE_TIMEOUT_SECONDS: ${ASSISTANT_ANALYSIS_QUEUE_TIMEOUT_SECONDS:-120}
+      ASSISTANT_ANALYSIS_TIMEOUT_SECONDS: ${ASSISTANT_ANALYSIS_TIMEOUT_SECONDS:-900}
+      ASSISTANT_CAPTURE_SYNC_TIMEOUT_SECONDS: ${ASSISTANT_CAPTURE_SYNC_TIMEOUT_SECONDS:-90}
+      ASSISTANT_CHAT_TURN_TIMEOUT_SECONDS: ${ASSISTANT_CHAT_TURN_TIMEOUT_SECONDS:-60}
+      ASSISTANT_CONVERSATION_TTL_SECONDS: ${ASSISTANT_CONVERSATION_TTL_SECONDS:-1800}
+      ASSISTANT_INSTANCE_LABEL: ${ASSISTANT_INSTANCE_LABEL:-}
     secrets: [assistant_session_secret, mcp_shared_secret]
     volumes:
       - assistant_data:/data
@@ -189,7 +209,7 @@ services:
     environment:
       OLLAMA_HOST: 0.0.0.0:11434
       OLLAMA_NUM_PARALLEL: "1"
-      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
       OLLAMA_CONTEXT_LENGTH: "4096"
       OLLAMA_MAX_QUEUE: "2"
       OLLAMA_KEEP_ALIVE: "5m"
@@ -214,6 +234,8 @@ services:
     profiles: [operations]
     network_mode: none
     read_only: true
+    tmpfs:
+      - /snapshot:size=1m,mode=1777
     cap_drop: [ALL]
     cap_add: [DAC_READ_SEARCH, CHOWN]
     security_opt:
@@ -226,7 +248,10 @@ services:
       - ./secrets:/snapshot/secrets:ro
       - ./.env:/snapshot/config.env:ro
       - ./docker-compose.yml:/snapshot/docker-compose.yml:ro
+      - ./docker-compose.external-ai.yml:/snapshot/docker-compose.external-ai.yml:ro
+      - ./docker-compose.lan.yml:/snapshot/docker-compose.lan.yml:ro
       - ./reverse-proxy/Caddyfile:/snapshot/Caddyfile:ro
+      - ./reverse-proxy/Caddyfile.lan:/snapshot/Caddyfile.lan:ro
       - ./backups:/backups
     entrypoint: ["/bin/sh", "-eu", "-c"]
     command: ["echo 'Use deploy/scripts/backup.sh, which stops writers before taking a snapshot.' >&2; exit 1"]

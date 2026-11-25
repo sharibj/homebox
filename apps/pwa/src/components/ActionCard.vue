@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { Action, Entity } from "../types";
-const props = defineProps<{ action: Action; busy: boolean; photoPreview?: string }>();
-defineEmits<{ confirm: []; cancel: []; refresh: []; dismiss: []; open: [entity: Entity] }>();
+const props = defineProps<{ action: Action; busy: boolean; photoPreview?: string; editable?: boolean; confirmDisabled?: boolean; cancelDisabled?: boolean }>();
+defineEmits<{ confirm: []; cancel: []; refresh: []; dismiss: []; open: [entity: Entity]; edit: [] }>();
 const savedEntity = computed(() => {
   const result = props.action.result;
   if (!result) return null;
@@ -53,12 +53,13 @@ const fieldLabels: Record<string, string> = {
     <p v-if="action.status === 'running'">Keep this screen open. Use “Check status” if the connection was interrupted.</p>
     <p v-if="action.status === 'failed' && action.retryable">The item already exists. Retry only the remaining photo or final-read step, not item creation.</p>
     <div class="button-row" v-if="action.status === 'proposed'">
-      <button type="button" class="primary" :disabled="busy" @click="$emit('confirm')">Confirm change</button>
-      <button type="button" class="secondary" :disabled="busy" @click="$emit('cancel')">Cancel change</button>
+      <button type="button" class="primary" :disabled="busy || confirmDisabled" @click="$emit('confirm')">Confirm change</button>
+      <button v-if="editable" type="button" class="secondary" :disabled="busy" @click="$emit('edit')">Edit draft</button>
+      <button type="button" class="secondary" :disabled="busy || cancelDisabled" @click="$emit('cancel')">Cancel change</button>
     </div>
     <div class="button-row" v-else>
       <button v-if="savedEntity" type="button" class="primary" :disabled="busy" @click="$emit('open', savedEntity)">Open saved record</button>
-      <button v-if="action.status === 'failed' && action.retryable === true" type="button" class="primary" :disabled="busy" @click="$emit('confirm')">Retry remaining step</button>
+      <button v-if="action.status === 'failed' && action.retryable === true" type="button" class="primary" :disabled="busy || confirmDisabled" @click="$emit('confirm')">Retry remaining step</button>
       <button v-if="['running','uncertain','failed'].includes(action.status)" type="button" class="secondary" :disabled="busy" @click="$emit('refresh')">Check status</button>
       <button v-if="['succeeded','cancelled','failed'].includes(action.status)" type="button" class="secondary" :disabled="busy" @click="$emit('dismiss')">Done</button>
     </div>

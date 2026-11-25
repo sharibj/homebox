@@ -1,0 +1,20 @@
+# Opt-in Wi-Fi HTTPS. Bind only the explicitly selected RFC1918 host address.
+# Keep the base loopback ports and include external-ai separately when selected.
+services:
+  proxy:
+    environment:
+      PROXY_LAN_IP: ${PROXY_LAN_IP:?Set the Mac Wi-Fi IPv4 address}
+      CADDY_DEFAULT_SNI: ${PROXY_LAN_IP}
+    ports:
+      - "${PROXY_LAN_IP}:443:443/tcp"
+      - "${PROXY_LAN_IP}:8443:8443/tcp"
+    volumes:
+      - ./reverse-proxy/Caddyfile.lan:/etc/caddy/Caddyfile:ro
+      - ./reverse-proxy/Caddyfile:/etc/caddy/Caddyfile.base:ro
+  assistant-api:
+    environment:
+      HOMEBOX_PUBLIC_ORIGIN: https://${PROXY_LAN_IP}:8443
+  backup:
+    volumes:
+      - ./docker-compose.lan.yml:/snapshot/docker-compose.lan.yml:ro
+      - ./reverse-proxy/Caddyfile.lan:/snapshot/Caddyfile.lan:ro
