@@ -1,13 +1,13 @@
-# Opt-in Wi-Fi HTTPS. Bind only the explicitly selected RFC1918 host address.
-# Keep the base loopback ports and include external-ai separately when selected.
+# Opt-in exact-address HTTPS. The explicit access migration can select all IPv4
+# listeners while retaining PROXY_LAN_IP as the certificate and advertised IP.
 services:
   proxy:
     environment:
       PROXY_LAN_IP: ${PROXY_LAN_IP:?Set the Mac Wi-Fi IPv4 address}
       CADDY_DEFAULT_SNI: ${PROXY_LAN_IP}
     ports:
-      - "${PROXY_LAN_IP}:443:443/tcp"
-      - "${PROXY_LAN_IP}:8443:8443/tcp"
+      - "${PROXY_LAN_BIND_IP:-${PROXY_LAN_IP}}:443:443/tcp"
+      - "${PROXY_LAN_BIND_IP:-${PROXY_LAN_IP}}:8443:8443/tcp"
     volumes:
       - ./reverse-proxy/Caddyfile.lan:/etc/caddy/Caddyfile:ro
       - ./reverse-proxy/Caddyfile:/etc/caddy/Caddyfile.base:ro

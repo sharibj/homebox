@@ -16,11 +16,14 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from .actions import Actions, public
+from .ai_settings import AISettings, AISettingsUpdate
 from .clients import Clients, ServiceError
 from .capture_jobs import CaptureJobs, MODEL_LOCK, draft_result
 from .config import Config
 from .conversations import Conversations
 from .images import VisionClient, normalize
+from .primary_binding import can_manage_ai_settings
+from .provider_runtime import operation_for
 from .schemas import ActionRequest, Collection, Confirm, Login, MappingCreate, MappingUpdate, Message
 from .state import State
 
@@ -79,7 +82,8 @@ def create_app(config=None, clients=None):
     cfg.uploads.mkdir(mode=0o700, parents=True, exist_ok=True)
     services = clients or Clients(cfg)
     actions = Actions(cfg, state, services)
-    vision = VisionClient(cfg)
+    ai_settings = AISettings(state, cfg)
+    vision = VisionClient(cfg, settings_snapshot=ai_settings.runtime_snapshot)
     jobs = CaptureJobs(cfg, state, services, vision)
     conversations = Conversations(cfg, state, services, actions, vision)
     limits = defaultdict(deque)
@@ -117,6 +121,7 @@ def create_app(config=None, clients=None):
     app.state.actions, app.state.vision = actions, vision
     app.state.capture_jobs = jobs
     app.state.conversations = conversations
+    app.state.ai_settings = ai_settings
 
     def rate(request, bucket, maximum, window=60, actor=None):
         now = time.monotonic()
@@ -206,6 +211,9 @@ def create_app(config=None, clients=None):
         groups = await services.homebox("GET", "/groups/all", {**value, "collection": ""})
         user = value["user"]
         context = state.chat_context(value)
+        roles = ai_settings.snapshot()
+        # Login has no persisted actor in its temporary response object yet.
+        identity = {**value, "actor": value.get("actor", user["id"])}
         selected = next((g for g in groups if g["id"] == value["collection"]), None)
         return {
             "user": {k: user.get(k, "") for k in ("id", "name", "email")},
@@ -214,9 +222,24 @@ def create_app(config=None, clients=None):
             "scope": {"instanceId": cfg.instance_id, "instanceLabel": cfg.instance_label or "Homebox " + cfg.instance_id[:8],
                       "collectionId": value["collection"], "collectionName": selected["name"] if selected else "Unavailable collection",
                       "contextVersion": context["version"]},
-            "ai": {"chat": {"provider": cfg.chat_provider_settings.kind, "model": cfg.chat_provider_settings.model},
-                   "vision": {"provider": cfg.vision_provider_settings.kind, "model": cfg.vision_provider_settings.model}},
+            "capabilities": {"canManageAISettings": can_manage_ai_settings(state, identity)},
+            "ai": {"chat": {"provider": roles.chat.kind, "model": roles.chat.model},
+                   "vision": {"provider": roles.vision.kind, "model": roles.vision.model}},
         }
+
+    async def primary_session(s=Depends(session)):
+        if not can_manage_ai_settings(state, s):
+            raise ServiceError("AI_SETTINGS_FORBIDDEN",
+                               "Only the installation's original account can manage AI settings.", 403)
+        return s
+
+    @app.get(PREFIX + "/settings/ai")
+    async def get_ai_settings(s=Depends(primary_session)):
+        return ai_settings.public()
+
+    @app.put(PREFIX + "/settings/ai")
+    async def put_ai_settings(body: AISettingsUpdate, s=Depends(primary_session)):
+        return ai_settings.update(body)
 
     @app.get("/healthz")
     async def health():
@@ -424,8 +447,9 @@ def create_app(config=None, clients=None):
         remaining = max(0, cfg.capture_sync_timeout - (time.monotonic() - request.state.started_at))
         try:
             async with asyncio.timeout(remaining):
-                async with state.collection_lock(MODEL_LOCK):
-                    return await jobs.analyze_photo(s, capture_id, normalized, hint)
+                with operation_for(jobs.vision):
+                    async with state.collection_lock(MODEL_LOCK):
+                        return await jobs.analyze_photo(s, capture_id, normalized, hint)
         except TimeoutError:
             return draft_result(capture_id, warning="Photo analysis reached the synchronous request time limit. Your photo is retained; enter the details manually.")
         except ServiceError as exc:

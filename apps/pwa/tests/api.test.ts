@@ -2,6 +2,18 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, createApi } from "../src/api";
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 describe("private API boundary", () => {
+  it("sends settings PUT through the same cookie, CSRF, collection and no-store boundary", async () => {
+    const fetcher = vi.fn().mockImplementation(async () => Response.json({ revision: 1 }));
+    vi.stubGlobal("fetch", fetcher);
+    await createApi(() => "csrf", () => "epoch", () => "A", () => 3)("/settings/ai", { method: "PUT", body: { revision: 0 } });
+    const [url, options] = fetcher.mock.calls[0];
+    expect(url).toBe("/api/assistant/v1/settings/ai"); expect(options.method).toBe("PUT");
+    expect(options.credentials).toBe("same-origin"); expect(options.cache).toBe("no-store");
+    expect(options.headers.get("X-CSRF-Token")).toBe("csrf");
+    expect(options.headers.get("X-Collection-ID")).toBe("A");
+    expect(options.headers.get("X-Context-Version")).toBe("3");
+    expect(options.body).toBe('{"revision":0}');
+  });
   it("sends the rendered context version even after returning to the same collection", async () => {
     const fetcher = vi.fn().mockImplementation(async () => Response.json({ ok: true }));
     vi.stubGlobal("fetch", fetcher);

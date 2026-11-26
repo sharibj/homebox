@@ -21,6 +21,12 @@ STATE = Path("/state")
 BASE = "http://127.0.0.1:7745/api/v1"
 CLIENT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+class AccountParser(argparse.ArgumentParser):
+    def error(self, message):
+        if message.startswith("unrecognized arguments:"):
+            message = "Unsupported account options. Passwords and tokens must never be command-line arguments."
+        super().error(message)
+
 class NativeError(ValueError):
     def __init__(self, status):
         self.status = status
@@ -72,7 +78,7 @@ def credentials(filename, *, registering=False):
         data["password"] = getpass.getpass("Password: ")
         if registering and getpass.getpass("Repeat password: ") != data["password"]:
             raise ValueError("Passwords differ.")
-    if not isinstance(data.get("username"), str) or not isinstance(data.get("password"), str):
+    if not isinstance(data, dict) or not isinstance(data.get("username"), str) or not isinstance(data.get("password"), str):
         raise ValueError("Credentials need username and password strings.")
     if registering and not isinstance(data.get("name"), str):
         raise ValueError("New users also need a name.")
@@ -80,10 +86,11 @@ def credentials(filename, *, registering=False):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("bootstrap", "collections", "members", "invite",
+    parser = AccountParser(description=__doc__)
+    parser.add_argument("action", choices=("bootstrap", "collections", "members", "invite", "create",
                                           "accept-invite", "remove-member"))
     parser.add_argument("--credentials-file", help="Owned 0600 filename inside the private lifecycle state directory")
+    parser.add_argument("--new-user-file", help="For create: owned 0600 new-account JSON filename in the same private state")
     parser.add_argument("--collection", help="Explicit collection UUID for scoped owner operations")
     parser.add_argument("--user", help="Exact member UUID, never an email search or wildcard")
     parser.add_argument("--output", default="invitation.json", help="New private invitation filename")
@@ -91,6 +98,10 @@ def main(argv=None):
     parser.add_argument("--confirm-revoke", action="store_true",
                         help="Acknowledge access revocation only, not deletion or logout")
     args = parser.parse_args(argv)
+    if args.action == "create":
+        import guided_users
+        guided_users.create(args, sys.modules[__name__])
+        return
     if args.action in ("members", "invite", "remove-member") and not args.collection:
         parser.error("--collection is required; no default collection is inferred")
     if args.collection:

@@ -29,7 +29,7 @@ services:
       CADDY_DEFAULT_SNI: ${ASSISTANT_HOST}
     ports:
       - "${PROXY_BIND_IP:-127.0.0.1}:80:80/tcp"
-      - "${PROXY_BIND_IP:-127.0.0.1}:443:443/tcp"
+      - "${PROXY_HTTPS_BIND_IP:-${PROXY_BIND_IP:-127.0.0.1}}:443:443/tcp"
     volumes:
       - ./reverse-proxy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

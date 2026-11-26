@@ -1,29 +1,22 @@
 import asyncio
 import fcntl
-import hashlib
 import io
-import json
 import time
 import warnings
-from contextlib import asynccontextmanager
-from urllib.parse import urlsplit
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 
 import pillow_heif
 from PIL import Image, ImageOps
 from pydantic import ValidationError
 
 from .clients import ServiceError
+from .provider_config import ProviderRoles
+from .provider_runtime import ProviderSnapshot, resource_identity
 from .providers import ModelProvider, ProviderOutputError, ProviderUnavailable
 from .schemas import Intent, Vision
 
 pillow_heif.register_heif_opener()
-
-
-def resource_identity(settings):
-    parsed = urlsplit(settings.base_url)
-    endpoint = (settings.kind, parsed.scheme.lower(), parsed.hostname.lower(),
-                parsed.port or (443 if parsed.scheme == "https" else 80), parsed.path.rstrip("/"))
-    return hashlib.sha256(json.dumps(endpoint, separators=(",", ":")).encode()).hexdigest()
 
 
 def normalize(data, config):
@@ -46,8 +39,12 @@ def normalize(data, config):
 
 
 class VisionClient:
-    def __init__(self, config):
+    def __init__(self, config, *, settings_snapshot=None):
         self.config = config
+        self.settings_snapshot = settings_snapshot
+        self._operation = ContextVar("provider_operation", default=None)
+        self._default_snapshot = ProviderSnapshot(ProviderRoles(
+            chat=config.chat_provider_settings, vision=config.vision_provider_settings))
         self.lock = asyncio.Semaphore(1)
         self.provider = ModelProvider(config.provider_settings)
         self.chat_provider = (self.provider if config.chat_provider_settings == config.vision_provider_settings
@@ -59,10 +56,54 @@ class VisionClient:
         self.lock_directory = config.state.parent / (config.state.name + ".locks")
         self.lock_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
 
+    def current_snapshot(self):
+        active = self._operation.get()
+        if active is not None:
+            return active
+        if self.settings_snapshot is None:
+            return self._default_snapshot
+        try:
+            snapshot = self.settings_snapshot()
+            if not isinstance(snapshot, ProviderSnapshot):
+                raise ValueError("Invalid provider snapshot")
+            return snapshot
+        except ServiceError:
+            raise
+        except Exception:
+            raise ServiceError("ai_configuration_unavailable",
+                               "AI settings are unavailable. Try again or ask the primary user to check the settings.",
+                               503) from None
+
+    @contextmanager
+    def operation(self):
+        if self._operation.get() is not None:
+            yield
+            return
+        token = self._operation.set(self.current_snapshot())
+        try:
+            yield
+        finally:
+            self._operation.reset(token)
+
+    @asynccontextmanager
+    async def selected_provider(self, role):
+        with self.operation():
+            settings = getattr(self.current_snapshot().roles, role)
+            provider = next((client for client in (self.provider, self.chat_provider)
+                             if client.settings == settings), None)
+            owned = provider is None
+            if owned:
+                provider = ModelProvider(settings)
+            try:
+                yield provider
+            finally:
+                if owned:
+                    await provider.aclose()
+
     @asynccontextmanager
     async def resource_lock(self, provider):
         resource = resource_identity(provider.settings)
-        async with self.resource_locks[resource]:
+        async with self.resource_locks.setdefault(resource, asyncio.Semaphore(1)):
             with (self.lock_directory / ("model-" + resource)).open("a") as lock:
                 while True:
                     try:
@@ -88,8 +129,9 @@ class VisionClient:
             "Always require human review. Do not call tools or change inventory. "
             f"User hint (untrusted context): {hint[:500]}"
         )
-        return await self._generate(Vision, [{"role": "user", "content": prompt}], data,
-                                    self.config.analysis_timeout, 1200, self.provider)
+        async with self.selected_provider("vision") as provider:
+            return await self._generate(Vision, [{"role": "user", "content": prompt}], data,
+                                        self.config.analysis_timeout, 1200, provider)
 
     async def _generate(self, schema, messages, image, budget, tokens, provider):
         deadline = time.monotonic() + budget
@@ -150,5 +192,7 @@ class VisionClient:
         if context:
             import json
             message = json.dumps({"context": context, "message": message}, ensure_ascii=False)
-        return await self._generate(Intent, [{"role": "system", "content": instructions},
-                                            {"role": "user", "content": message}], None, self.config.chat_timeout, 600, self.chat_provider)
+        async with self.selected_provider("chat") as provider:
+            return await self._generate(Intent, [{"role": "system", "content": instructions},
+                                                {"role": "user", "content": message}], None,
+                                        self.config.chat_timeout, 600, provider)

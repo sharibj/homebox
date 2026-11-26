@@ -10,7 +10,7 @@ from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 
 from .clients import ServiceError
-from .images import resource_identity
+from .provider_runtime import operation_for, snapshot_for, vision_configuration
 
 MODEL_LOCK = "_photo-analysis"
 ACTIVE = {"queued", "running"}
@@ -44,10 +44,7 @@ class CaptureJobs:
         self.wake = asyncio.Event()
 
     def configuration(self):
-        settings = self.cfg.vision_provider_settings
-        return json.dumps({"provider": settings.kind, "model": settings.model,
-                           "baseUrlFingerprint": resource_identity(settings)},
-                          sort_keys=True, separators=(",", ":"))
+        return vision_configuration(snapshot_for(self.vision, self.cfg))
 
     def persist_photo(self, session, normalized):
         capture_id = "c_" + secrets.token_urlsafe(24)
@@ -70,6 +67,10 @@ class CaptureJobs:
             raise
 
     def submit(self, session, key, normalized, hint, location_id):
+        with operation_for(self.vision):
+            return self._submit(session, key, normalized, hint, location_id)
+
+    def _submit(self, session, key, normalized, hint, location_id):
         fingerprint = hashlib.sha256(normalized + json.dumps(
             {"hint": hint, "locationId": location_id}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         capture_id = filename = None
@@ -201,61 +202,67 @@ class CaptureJobs:
         return session
 
     async def analyze_photo(self, session, capture_id, normalized, hint):
-        answer = await self.vision.analyze(normalized, hint)
-        result = draft_result(capture_id, answer)
-        item = answer.items[0]
-        result["duplicates"] = (await self.clients.tool(session, "search_items", {"query": item.model or item.name}))["items"]
-        result["locations"] = (await self.clients.tool(session, "list_locations"))["locations"]
-        return result
-
-    async def process(self, row):
-        if row["configuration"] != self.configuration():
-            self.manual(row, "analysis_configuration_changed",
-                        "The configured photo-analysis service or model changed. Your photo was not sent to the new configuration; enter its details manually.")
-            return
-        async def analyze():
-            session = await self.authorized_context(row)
-            capture = self.state.one("SELECT filename FROM captures WHERE id=?", (row["capture_id"],))
-            if not capture:
-                raise ServiceError("capture_expired", "The temporary photo expired. Take a new photo.", 410)
-            normalized = await asyncio.to_thread((self.cfg.uploads / capture["filename"]).read_bytes)
-            hint = self.cfg.cipher.decrypt(row["hint"].encode()).decode()
-            result = await self.analyze_photo(session, row["capture_id"], normalized, hint)
-            await self.authorized_context(row)
+        with operation_for(self.vision):
+            answer = await self.vision.analyze(normalized, hint)
+            result = draft_result(capture_id, answer)
+            item = answer.items[0]
+            result["duplicates"] = (await self.clients.tool(session, "search_items", {"query": item.model or item.name}))["items"]
+            result["locations"] = (await self.clients.tool(session, "list_locations"))["locations"]
             return result
 
-        async def watch_context():
-            while True:
-                await asyncio.sleep(.5)
-                self.local_context(row)
-
-        work = guard = None
+    async def process(self, row):
         try:
-            async with asyncio.timeout(self.cfg.analysis_timeout):
-                work, guard = asyncio.create_task(analyze()), asyncio.create_task(watch_context())
-                done, _ = await asyncio.wait((work, guard), return_when=asyncio.FIRST_COMPLETED)
-                if guard in done:
-                    await guard
-                result = await work
-                self.finish(row, "succeeded", result)
-        except TimeoutError:
-            self.manual(row, "analysis_timed_out",
-                        "Photo analysis reached its time limit. Your photo is retained; enter the details manually.")
+            with operation_for(self.vision):
+                if row["configuration"] != self.configuration():
+                    self.manual(row, "analysis_configuration_changed",
+                                "The configured photo-analysis service or model changed. Your photo was not sent to the new configuration; enter its details manually.")
+                    return
+
+                async def analyze():
+                    session = await self.authorized_context(row)
+                    capture = self.state.one("SELECT filename FROM captures WHERE id=?", (row["capture_id"],))
+                    if not capture:
+                        raise ServiceError("capture_expired", "The temporary photo expired. Take a new photo.", 410)
+                    normalized = await asyncio.to_thread((self.cfg.uploads / capture["filename"]).read_bytes)
+                    hint = self.cfg.cipher.decrypt(row["hint"].encode()).decode()
+                    result = await self.analyze_photo(session, row["capture_id"], normalized, hint)
+                    await self.authorized_context(row)
+                    return result
+
+                async def watch_context():
+                    while True:
+                        await asyncio.sleep(.5)
+                        self.local_context(row)
+
+                work = guard = None
+                try:
+                    async with asyncio.timeout(self.cfg.analysis_timeout):
+                        work, guard = asyncio.create_task(analyze()), asyncio.create_task(watch_context())
+                        done, _ = await asyncio.wait((work, guard), return_when=asyncio.FIRST_COMPLETED)
+                        if guard in done:
+                            await guard
+                        result = await work
+                        self.finish(row, "succeeded", result)
+                except TimeoutError:
+                    self.manual(row, "analysis_timed_out",
+                                "Photo analysis reached its time limit. Your photo is retained; enter the details manually.")
+                except ServiceError as exc:
+                    if exc.status in {401, 403, 409} or exc.code == "capture_expired":
+                        self.finish(row, "failed", error={"code": exc.code, "message": exc.message})
+                    else:
+                        self.manual(row, exc.code, exc.message)
+                except (OSError, ValueError):
+                    self.manual(row, "analysis_interrupted",
+                                "Photo analysis was interrupted. If the photo is still available, enter its details manually.")
+                finally:
+                    tasks = [task for task in (work, guard) if task is not None]
+                    for task in tasks:
+                        task.cancel()
+                    # Collect child cancellation/errors without suppressing cancellation
+                    # of this worker while it awaits their cleanup.
+                    await asyncio.gather(*tasks, return_exceptions=True)
         except ServiceError as exc:
-            if exc.status in {401, 403, 409} or exc.code == "capture_expired":
-                self.finish(row, "failed", error={"code": exc.code, "message": exc.message})
-            else:
-                self.manual(row, exc.code, exc.message)
-        except (OSError, ValueError):
-            self.manual(row, "analysis_interrupted",
-                        "Photo analysis was interrupted. If the photo is still available, enter its details manually.")
-        finally:
-            tasks = [task for task in (work, guard) if task is not None]
-            for task in tasks:
-                task.cancel()
-            # Collect child cancellation/errors without suppressing cancellation
-            # of this worker while it awaits their cleanup.
-            await asyncio.gather(*tasks, return_exceptions=True)
+            self.manual(row, exc.code, exc.message)
 
     async def step(self):
         self.refresh()

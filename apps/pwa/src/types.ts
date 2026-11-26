@@ -8,12 +8,19 @@ export interface PublicAi {
 }
 export interface Session {
   ai?: PublicAi;
+  capabilities?: { canManageAISettings: boolean };
   scope?: ChatScope;
   user: { id: string; email: string; name: string };
   collections: { id: string; name: string }[];
   collectionId: string;
   csrfToken: string;
 }
+export interface AiSettingsRole extends AiRole { baseUrl: string; keyConfigured: boolean }
+export interface AiSettings { revision: number; chat: AiSettingsRole; vision: AiSettingsRole }
+export type AiSettingsRoleUpdate = AiRole & { baseUrl: string } & (
+  { keyAction: "keep" | "clear"; apiKey?: never } | { keyAction: "replace"; apiKey: string }
+);
+export interface AiSettingsUpdate { revision: number; chat: AiSettingsRoleUpdate; vision: AiSettingsRoleUpdate }
 export interface Entity {
   id: string;
   name: string;

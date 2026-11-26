@@ -2,7 +2,8 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { ApiError, createApi } from "./api";
 import { confirmationKey, emptyDraft, tagNames, tagRoute, validatePhoto } from "./helpers";
-import type { Action, ActionType, CaptureJob, Draft, Entity, Location, Mapping, Session } from "./types";
+import type { Action, ActionType, AiSettings as AiSettingsValue, CaptureJob, Draft, Entity, Location, Mapping, Session } from "./types";
+import { canManageAiSettings } from "./ai-settings-editor";
 import { mergeCaptureDraft, type DraftField } from "./capture-draft";
 import { useCaptureJobs } from "./useCaptureJobs";
 import { useConversation } from "./useConversation";
@@ -10,6 +11,7 @@ import ConversationPanel from "./components/ConversationPanel.vue";
 import "./conversation.css";
 import ActionCard from "./components/ActionCard.vue";
 import AiDetails from "./components/AiDetails.vue";
+import AiSettings from "./components/AiSettings.vue";
 import CaptureProgress from "./components/CaptureProgress.vue";
 import DraftForm from "./components/DraftForm.vue";
 import EntityList from "./components/EntityList.vue";
@@ -25,7 +27,11 @@ const notice = ref("");
 const online = ref(navigator.onLine);
 const username = ref("");
 const password = ref("");
-const tab = ref<"ask" | "capture" | "places">("ask");
+type Tab = "ask" | "capture" | "places" | "settings";
+const tab = ref<Tab>(new URL(window.location.href).searchParams.get("page") === "ai-settings" ? "settings" : "ask");
+const settingsView = ref<InstanceType<typeof AiSettings> | null>(null);
+const canManageSettings = computed(() => canManageAiSettings(session.value));
+const inventoryDisabled = computed(() => busy.value || !online.value || !session.value?.collectionId || !recoveryReady.value);
 const locations = ref<Location[]>([]);
 const query = ref("");
 const results = ref<Entity[]>([]);
@@ -177,6 +183,8 @@ function resetDraft() {
   duplicates.value = []; warnings.value = []; draftLocation.value = "";
 }
 function clearPrivate() {
+  settingsView.value?.clearPrivate();
+  if (tab.value === "settings") { tab.value = "ask"; settingsUrl("ask"); }
   draftReview = null; draftEditVersion++;
   epoch++; locations.value = []; results.value = []; resultTotal.value = 0; searched.value = false;
   conversation.reset(); actionIntent++; query.value = ""; action.value = null;
@@ -187,6 +195,35 @@ function clearPrivate() {
   editMode.value = ""; mappingLabel.value = ""; resetDraft(); tagError.value = "";
   editDraft.value = emptyDraft(); editedTags.value = ""; destination.value = "";
   locationName.value = ""; locationParent.value = ""; locationDescription.value = "";
+}
+function settingsUrl(next: Tab) {
+  const url = new URL(window.location.href);
+  if (next === "settings") url.searchParams.set("page", "ai-settings");
+  else url.searchParams.delete("page");
+  window.history.replaceState(null, "", url);
+}
+async function canLeaveSettings() { return tab.value !== "settings" || !settingsView.value || await settingsView.value.confirmLeave(); }
+async function showTab(next: Tab) {
+  if (next === tab.value || !await canLeaveSettings()) return;
+  tab.value = next; detail.value = null; editMode.value = ""; settingsUrl(next);
+}
+async function home(event: MouseEvent) {
+  if (tab.value !== "settings" || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  if (await canLeaveSettings()) window.location.assign("/");
+}
+function settingsSnapshot(value: AiSettingsValue) {
+  if (session.value) session.value.ai = {
+    chat: { provider: value.chat.provider, model: value.chat.model },
+    vision: { provider: value.vision.provider, model: value.vision.model },
+  };
+}
+async function settingsBoundary(cause: unknown) {
+  if (cause instanceof ApiError && cause.status === 403) {
+    settingsView.value?.clearPrivate();
+    if (session.value) session.value.capabilities = { canManageAISettings: false };
+    error.value = "AI settings access is unavailable. Only the original installation account can manage these settings.";
+  } else await handleFailure(cause, "Managing AI settings");
 }
 async function perform(label: string, task: () => Promise<void>) {
   if (busy.value) return;
@@ -263,6 +300,7 @@ async function login() {
   password.value = "";
 }
 async function logout() {
+  if (!await canLeaveSettings()) return;
   await perform("Signing out", async () => {
     await api("/auth/logout", { method: "POST", body: {} });
     clearPrivate(); session.value = null; notice.value = "Signed out.";
@@ -276,6 +314,7 @@ async function changeCollection(event: Event) {
 async function switchCollection(id: string) {
   if (!session.value?.collections.some(collection => collection.id === id)) return;
   if (id === session.value?.collectionId) return;
+  if (!await canLeaveSettings()) return;
   await perform("Changing collection", async () => {
     clearPrivate();
     session.value = await api<Session>("/session/collection", { method: "POST", body: { collectionId: id } });
@@ -457,7 +496,7 @@ onUnmounted(() => {
   <a class="skip-link" href="#main">Skip to inventory</a>
   <div class="app-frame">
     <header class="app-header">
-      <a href="/" class="brand" aria-label="Homebox Companion home"><img src="/icon.svg" width="38" height="38" alt=""><span>homebox<small>COMPANION</small></span></a>
+      <a href="/" class="brand" aria-label="Homebox Companion home" @click="home"><img src="/icon.svg" width="38" height="38" alt=""><span>homebox<small>COMPANION</small></span></a>
       <span class="private-label">On your home server</span>
       <AiDetails v-if="session" :ai="session.ai"/>
       <button v-if="session" class="text-button" :disabled="busy || !online" @click="logout">Sign out</button>
@@ -484,7 +523,11 @@ onUnmounted(() => {
         </div>
       </section>
       <template v-else>
-        <section class="collection-bar" aria-label="Active collection"><div><p class="eyebrow">Your inventory</p><h1>{{ currentCollection }}</h1></div><label>Collection<select aria-label="Collection" :value="session.collectionId" :disabled="busy || !online" @change="changeCollection"><option v-for="collection in session.collections" :key="collection.id" :value="collection.id">{{ collection.name }}</option></select></label></section>
+        <section v-if="tab !== 'settings'" class="collection-bar" aria-label="Active collection"><div><p class="eyebrow">Your inventory</p><h1>{{ currentCollection }}</h1></div><label>Collection<select aria-label="Collection" :value="session.collectionId" :disabled="busy || !online" @change="changeCollection"><option v-for="collection in session.collections" :key="collection.id" :value="collection.id">{{ collection.name }}</option></select></label></section>
+        <nav class="tabs" :class="{ 'has-ai-settings': canManageSettings }" aria-label="Companion tools"><button :disabled="inventoryDisabled" :aria-current="tab === 'ask' ? 'page' : undefined" @click="showTab('ask')">Find &amp; ask</button><button :disabled="inventoryDisabled" :aria-current="tab === 'capture' ? 'page' : undefined" @click="showTab('capture')">Add an item</button><button :disabled="inventoryDisabled" :aria-current="tab === 'places' ? 'page' : undefined" @click="showTab('places')">Places</button><button v-if="canManageSettings" :aria-current="tab === 'settings' ? 'page' : undefined" @click="showTab('settings')">AI settings</button></nav>
+        <AiSettings v-if="tab === 'settings' && canManageSettings" ref="settingsView" :api="api" :online="online" @snapshot="settingsSnapshot" @boundary="settingsBoundary"/>
+        <section v-else-if="tab === 'settings'" class="card stack" role="alert"><h2>AI settings unavailable</h2><p>Only the original installation account can manage AI settings. Sign in with that account or ask your local operator to check its access.</p></section>
+        <template v-else>
         <p v-if="!session.collections.length" class="banner warning">Your account has no accessible collections. Ask your Homebox administrator for access.</p>
         <p v-if="recoveryWarning" class="banner warning" role="status">{{ recoveryWarning }}</p>
         <div v-if="tagError" class="banner warning" role="alert"><strong>Tag unavailable.</strong> {{ tagError }}<button class="text-button" :disabled="busy || !online" @click="perform('Checking tag', resolveTag)">Try tag again</button></div>
@@ -519,7 +562,6 @@ onUnmounted(() => {
             <hr><TagPanel :key="detail.id" :mappings="mappings" :entity="detail" :locations="locations" @create="createTag" @update="updateTag"/>
           </section>
           <template v-else>
-            <nav class="tabs" aria-label="Companion tools"><button :aria-current="tab === 'ask' ? 'page' : undefined" @click="tab = 'ask'">Find &amp; ask</button><button :aria-current="tab === 'capture' ? 'page' : undefined" @click="tab = 'capture'">Add an item</button><button :aria-current="tab === 'places' ? 'page' : undefined" @click="tab = 'places'">Places</button></nav>
             <section v-if="tab === 'ask'" class="stack">
               <ConversationPanel :state="conversation.state" :collection-name="currentCollection" :action="action" :disabled="busy || !online || !recoveryReady"
                 @composer="conversation.updateComposer" @send="conversation.send" @retry="conversation.retry" @recover="conversation.recover" @restore="conversation.restore"
@@ -557,6 +599,7 @@ onUnmounted(() => {
             </section>
           </template>
         </fieldset>
+        </template>
       </template>
     </main>
     <footer>Private by design. Organized by you.<span>Homebox Companion</span></footer>

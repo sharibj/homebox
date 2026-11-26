@@ -23,6 +23,10 @@ class State:
                 CREATE TABLE IF NOT EXISTS metadata (
                     name TEXT PRIMARY KEY, value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ai_settings (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    revision INTEGER NOT NULL CHECK(revision>0), ciphertext TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY, token TEXT NOT NULL, actor TEXT NOT NULL,
                     collection TEXT NOT NULL, csrf TEXT NOT NULL, expires REAL NOT NULL
@@ -89,9 +93,9 @@ class State:
                 raise RuntimeError("Assistant state belongs to a different Homebox instance. Restore matching data and HOMEBOX_INSTANCE_ID.")
             if not bound:
                 has_data = any(db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
-                               for table in ("sessions", "actions", "captures", "capture_jobs", "mappings", "audit",
+                               for table in ("ai_settings", "sessions", "actions", "captures", "capture_jobs", "mappings", "audit",
                                              "chat_contexts", "conversations", "chat_turns", "chat_action_links", "chat_initial_keys"))
-                if has_data:
+                if has_data or db.execute("SELECT 1 FROM metadata LIMIT 1").fetchone():
                     raise RuntimeError("Existing assistant state has no Homebox instance binding. Do not adopt it without verifying its source.")
                 db.execute("INSERT INTO metadata VALUES('homebox_instance_id',?)", (instance_id,))
             # A killed process must not silently repeat a possibly committed write.

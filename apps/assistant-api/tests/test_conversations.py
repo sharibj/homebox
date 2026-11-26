@@ -359,12 +359,24 @@ def test_conversation_cannot_cross_browser_session_or_revoked_membership(setup):
 
 
 def test_chat_configuration_reset_is_independent_of_vision(setup):
+    from assistant.ai_settings import AISettings, AISettingsUpdate
+
     client, app, fake, _ = setup
     original = turn(client, "Which inventory do I have?")
-    cfg = app.state.config
-    cfg.ai_roles = replace(cfg.ai_roles, vision=replace(cfg.ai_roles.vision, model="synthetic-other-vision"))
+    settings = AISettings(app.state.store, app.state.config)
+
+    def save_model(role, model):
+        current = settings.public()
+        payload = {"revision": current["revision"]}
+        for name in ("chat", "vision"):
+            payload[name] = {key: current[name][key] for key in ("provider", "baseUrl", "model")}
+            payload[name]["keyAction"] = "keep"
+        payload[role]["model"] = model
+        settings.update(AISettingsUpdate.model_validate(payload))
+
+    save_model("vision", "synthetic-other-vision")
     unchanged = turn(client, "Show my inventory", original)
-    cfg.ai_roles = replace(cfg.ai_roles, chat=replace(cfg.ai_roles.chat, model="synthetic-other-chat"))
+    save_model("chat", "synthetic-other-chat")
     response = client.post(PREFIX + "/chat", json={"message":"Show my inventory",
         "conversationId":unchanged["conversationId"],"expectedRevision":unchanged["revision"],"clientTurnId":str(uuid4())})
     assert response.status_code == 409

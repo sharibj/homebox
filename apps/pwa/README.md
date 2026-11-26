@@ -14,6 +14,7 @@ A separate mobile-first Vue 3, TypeScript, and Vite app. It does not change Home
 - Confirmed moves, edits, replacement tags, and new locations.
 - Stable authenticated NFC URL landing pages, QR labels, reassignment, and revocation. Use a separate phone app to write NFC URL records.
 - An install manifest and an offline **static shell**, not offline inventory or writes.
+- A separate AI settings page for the installation's original account, with independent Chat and Images providers, base URLs, model IDs, and write-only key updates.
 
 The API contracts are in `../assistant-api/CONTRACT.md` and `../assistant-api/CHAT_CONTRACT.md`. All calls use the same-origin prefix `/api/assistant/v1`. The reverse proxy must forward that prefix unchanged. `/t/<tagId>` is a client-side landing route. The container serves static files on port 8080 and reports health at `/healthz`.
 
@@ -47,9 +48,21 @@ If the upload response is lost, the app searches by the same opaque submission k
 
 Manual edits stay in memory while the job runs, including fields edited and then cleared. A reload does not preserve those unsaved edits or the local photo preview. It can recover the server's retained photo and suggestions. Removing/replacing a photo, signing out, or switching collections stops polling and rejects old responses. Stopping progress does not cancel server analysis.
 
-The optional public AI metadata appears in a compact summary. Open Details to see each role's provider, full model name, and endpoint disclosure: Chat and Images. Unknown providers use a neutral label and endpoint disclosure, never an Ollama or local label. Provider URLs and keys stay on the server. Older shared metadata and servers without metadata still work.
+The optional public AI metadata appears behind the compact AI details button. Open it to see each role's provider, full model name, and endpoint disclosure: Chat and Images. Unknown providers use a neutral label and endpoint disclosure, never an Ollama or local label. This read-only dialog never shows base URLs or API keys. Older shared metadata and servers without metadata still work.
 
 The service worker caches an explicit build-time list of public static files. It does not intercept API requests, cache navigation responses, or cache photos and other private responses.
+
+### AI settings
+
+Only `session.capabilities.canManageAISettings === true` exposes the AI settings tab. The server authorizes every settings request against its pinned original-account UUID. Collection ownership, superuser status, and first sign-in never grant access. A local operator must provision the original-account binding. An absent capability hides the tab. Direct `/?page=ai-settings` entry also fails closed, and a server 403 removes access and clears the editor.
+
+The page sits outside inventory collection and recovery gates. It can load settings even when inventory recovery fails or no collection is selected. Offline users can open the page, but loading and saving require a connection.
+
+The form supports the four existing provider kinds and custom exact model IDs. Base URLs are visible only in this authorized editor. Enter a replacement key in a password field, keep the current key setting, or explicitly clear it. Blank input never means clear. Changing a provider or complete endpoint requires Replace or Clear; changing only the model can Keep.
+
+Nothing changes until **Save both roles** sends one revision-checked PUT. Defaults remain active before that first Save. Saving does not contact a provider, list or download models, or run inference. A changed revision or uncertain response keeps the draft and requires an explicit reload before another Save. Reload warns before discarding edits. The saved public metadata refreshes only from a successful server response.
+
+Keys stay only in component memory. Save, discard, sign-out, permission/session loss, unmount, and pagehide clear them. A page-cache restore reloads only redacted settings. Tab changes, home navigation, sign-out, and browser unload warn about unsaved edits. Settings and keys never enter browser storage, conversation history, logs, or the URL. The server returns only `keyConfigured`, never key material. See `../assistant-api/AI_SETTINGS_CONTRACT.md`.
 
 ## Build and test in Docker
 
@@ -83,9 +96,10 @@ docker run --rm --network container:homebox-pwa-ui-fixture \
   -v "$PWD/tests/browser/companion.spec.mjs:/browser/companion.spec.mjs:ro" \
   -v "$PWD/tests/browser/async-capture.spec.mjs:/browser/async-capture.spec.mjs:ro" \
   -v "$PWD/tests/browser/ai-details.spec.mjs:/browser/ai-details.spec.mjs:ro" \
+  -v "$PWD/tests/browser/ai-settings.spec.mjs:/browser/ai-settings.spec.mjs:ro" \
   -v "$PWD/tests/browser/conversation.spec.mjs:/browser/conversation.spec.mjs:ro" \
   -v "$PWD/tests/browser/conversation-visual.spec.mjs:/browser/conversation-visual.spec.mjs:ro" \
-  homebox-pwa-browser:local npm test -- companion.spec.mjs async-capture.spec.mjs ai-details.spec.mjs conversation.spec.mjs conversation-visual.spec.mjs
+  homebox-pwa-browser:local npm test -- companion.spec.mjs async-capture.spec.mjs ai-details.spec.mjs ai-settings.spec.mjs conversation.spec.mjs conversation-visual.spec.mjs
 docker stop homebox-pwa-ui-fixture
 ```
 

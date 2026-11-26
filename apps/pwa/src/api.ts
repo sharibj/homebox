@@ -4,7 +4,7 @@ export class ApiError extends Error {
 }
 export function createApi(getCsrf: () => string | undefined, getContext: () => unknown = () => undefined, getCollection: () => string | undefined = () => undefined, getContextVersion: () => string | number | undefined = () => undefined) {
   return async function request<T>(path: string, options: {
-    method?: "GET" | "POST" | "PATCH";
+    method?: "GET" | "POST" | "PATCH" | "PUT";
     body?: unknown;
     idempotencyKey?: string;
     timeoutMs?: number;

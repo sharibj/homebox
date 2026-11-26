@@ -20,7 +20,11 @@ access_compose() {
   set -- -f "$DEPLOY/docker-compose.yml" "$@"
   docker compose -p "$PROJECT" --env-file "$access_env" "$@"
 }
-confirm "Change private HTTPS access only, preserving all images, data, keys and the existing CA?"
+if [ "${ACCESS_LISTEN_ALL:-0}" = 1 ]; then
+  confirm "Publish HTTPS 443/8443 on ALL IPv4 interfaces, preserving images, data, keys and the existing CA?"
+else
+  confirm "Apply the selected HTTPS access configuration, preserving images, data, keys and the existing CA?"
+fi
 if [ "$ACCESS_ACTION" != rollback ] && { [ "$ACCESS_ACTION" = tailscale ] || [ "$LAN" = 1 ]; }; then
   tailscale ip -4 >"$STATE/work/tailscale-ip.txt"
 fi

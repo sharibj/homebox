@@ -18,10 +18,12 @@ usage() {
     '  adopt                  Explicitly bind a validated existing stack to this state directory' \
     '  status                 Show service health and separate AI setup status' \
     '  backup                 Drain safely and retain a consistent private snapshot' \
-    '  access tailscale --ip IP  Add private Tailnet HTTPS to a completed installation' \
+    '  access tailscale --ip IP [--listen-all]  Add HTTPS; optionally listen on all interfaces' \
     '  access resume|rollback  Recover the pending configuration-only transition' \
     '  models status|pull --confirm-download  Explicit local Ollama model setup' \
     '  users bootstrap        Explicit first-owner bootstrap for a fresh managed install' \
+    '  users ai-primary [--confirm-original-user-id UUID]  Inspect/attest the original AI-settings account' \
+    '  users create           Guided new account and existing-household membership' \
     '  users collections|members|invite|accept-invite|remove-member [OPTIONS]' \
     '  users restore-registration  Recover the exact prior flag after interruption' \
     'See docs/assistant/local-lifecycle.md. No model download or CA trust is automatic.'
@@ -43,14 +45,17 @@ MODEL_RECOVERY=0
 if [ "$COMMAND" = models ] && [ "${1:-}" = restore-network ]; then MODEL_RECOVERY=1; fi
 ACCESS_ACTION=
 ACCESS_IP=
+ACCESS_LISTEN_ALL=0
 ACCESS_PHASE=
 ACCESS_ACTIVE=0
 if [ "$COMMAND" = access ]; then
   ACCESS_ACTION=${1:-}; [ "$#" -eq 0 ] || shift
   case "$ACCESS_ACTION" in
     tailscale)
-      [ "$#" -eq 2 ] && [ "$1" = --ip ] || { usage >&2; exit 2; }
-      ACCESS_IP=$2 ;;
+      { [ "$#" -eq 2 ] || { [ "$#" -eq 3 ] && [ "$3" = --listen-all ]; }; } &&
+        [ "$1" = --ip ] || { usage >&2; exit 2; }
+      ACCESS_IP=$2
+      [ "$#" -ne 3 ] || ACCESS_LISTEN_ALL=1 ;;
     resume|rollback) [ "$#" -eq 0 ] || { usage >&2; exit 2; } ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -196,12 +201,26 @@ meta() {
     -e "LC_REGISTRATION_RECOVERY=$REGISTRATION_RECOVERY" \
     -e "LC_MODEL_RECOVERY=$MODEL_RECOVERY" \
     -e "LC_ACCESS_ACTION=$ACCESS_ACTION" -e "LC_ACCESS_IP=$ACCESS_IP" \
+    -e "LC_ACCESS_LISTEN_ALL=$ACCESS_LISTEN_ALL" \
     -e "LC_ACCESS_PHASE=$ACCESS_PHASE" \
     -e "LC_TEST_OVERRIDE=$TEST_OVERRIDE" \
     --mount "type=bind,source=$ROOT,target=/source,readonly" \
     --mount "type=bind,source=$DEPLOY,target=/deployment" \
     --mount "type=bind,source=$STATE,target=/state" \
     "$@"
+}
+primary_meta() {
+  set -- "$PYTHON" python -B /source/deploy/lifecycle/primary.py "$@"
+  [ -z "$TEST_OVERRIDE" ] || set -- --mount \
+    "type=bind,source=$TEST_OVERRIDE,target=/selected-compose-override.yml,readonly" "$@"
+  docker run --rm -i --pull never --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges:true --user "$(id -u):$(id -g)" \
+    -e "LC_ROOT=$ROOT" -e "LC_STATE=$STATE" -e "LC_PROJECT=$PROJECT" \
+    -e "LC_DAEMON=$DAEMON" -e LC_COMMAND=users -e "LC_ENGINE_OS=$ENGINE_OS" \
+    -e "LC_TEST_OVERRIDE=$TEST_OVERRIDE" \
+    --mount "type=bind,source=$ROOT,target=/source,readonly" \
+    --mount "type=bind,source=$DEPLOY,target=/deployment" \
+    --mount "type=bind,source=$STATE,target=/state" "$@"
 }
 capture() {
   ids=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
@@ -341,6 +360,14 @@ if [ "$COMMAND" = models ]; then
 fi
 if [ "$COMMAND" = users ]; then
   action=${1:-}; [ "$#" -eq 0 ] || shift
+  if [ "$action" = ai-primary ]; then
+    . "$DEPLOY/lifecycle/primary.sh"
+    exit 0
+  fi
+  if [ "$action" = create ]; then
+    . "$DEPLOY/lifecycle/create-user.sh"
+    exit 0
+  fi
   case "$action" in
     bootstrap|collections|members|invite|accept-invite|remove-member) ;;
     *) usage >&2; exit 2 ;;

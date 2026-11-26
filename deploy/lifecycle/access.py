@@ -74,7 +74,38 @@ def plan(m):
     path = directory(m) / "plan.json"
     if path.is_symlink() or m.file_digest(path) != m.journal()["access_change"].get("sha256"):
         raise ValueError("Private access plan identity changed.")
-    return m.load(path)
+    value = m.load(path)
+    if value.get("listener_mode", "address") not in ("address", "all-ipv4"):
+        raise ValueError("Unknown access listener mode; restore the matching reviewed source.")
+    return value
+
+
+def listener_mode(env):
+    """Only the exact paired HTTPS overrides form the explicit wildcard mode."""
+    if env.get("PROXY_BIND_IP", "127.0.0.1") != "127.0.0.1":
+        raise ValueError("Access preserves the original loopback HTTP listener.")
+    https, lan = env.get("PROXY_HTTPS_BIND_IP", ""), env.get("PROXY_LAN_BIND_IP", "")
+    if https == lan == "0.0.0.0":
+        address(env.get("PROXY_LAN_IP", ""))
+        return "all-ipv4"
+    if https not in ("", "127.0.0.1") or lan not in ("", env.get("PROXY_LAN_IP", "")):
+        raise ValueError("HTTPS bind overrides must be the exact paired all-IPv4 mode or private defaults.")
+    return "address"
+
+
+def listener_ports(ip, mode):
+    ports = [{"mode": "ingress", "host_ip": "127.0.0.1", "target": 80,
+              "published": "80", "protocol": "tcp"}]
+    if mode == "all-ipv4":
+        ports += [{"mode": "ingress", "host_ip": "0.0.0.0", "target": port,
+                   "published": str(port), "protocol": "tcp"} for port in (443, 8443)]
+    else:
+        ports.append({"mode": "ingress", "host_ip": "127.0.0.1", "target": 443,
+                      "published": "443", "protocol": "tcp"})
+        if ip:
+            ports += [{"mode": "ingress", "host_ip": ip, "target": port,
+                       "published": str(port), "protocol": "tcp"} for port in (443, 8443)]
+    return ports
 
 
 def phase(m, value, direction=None):
@@ -173,21 +204,26 @@ def prepare(m):
     info = (m.DEPLOY / ".env").stat()
     if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
         raise ValueError("The protected environment must be owned and private.")
-    if env.get("PROXY_BIND_IP", "127.0.0.1") != "127.0.0.1" or env.get("TLS_ISSUER", "internal") != "internal":
-        raise ValueError("This transition preserves loopback listeners and requires internal TLS.")
+    before_mode = listener_mode(env)
+    flag = os.environ.get("LC_ACCESS_LISTEN_ALL", "0")
+    if flag not in ("0", "1"):
+        raise ValueError("Unknown explicit listener selection.")
+    mode = "all-ipv4" if flag == "1" else "address"
+    if env.get("TLS_ISSUER", "internal") != "internal":
+        raise ValueError("This transition requires internal TLS.")
     if set(m.config()["services"]) - {"backup"} != set(m.SERVICES):
         raise ValueError("Access requires the six-service published configuration.")
-    if not os.environ.get("LC_TEST_OVERRIDE") and public_ports(m.config()["services"]["proxy"]) != {
-            "80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "80"}],
-            "443/tcp": [{"HostIp": "127.0.0.1", "HostPort": "443"}]} and not env.get("PROXY_LAN_IP"):
-        raise ValueError("Access only adds to the original loopback 80/443 listeners.")
+    if not os.environ.get("LC_TEST_OVERRIDE") and public_ports(m.config()["services"]["proxy"]) != public_ports(
+            {"ports": listener_ports(env.get("PROXY_LAN_IP"), before_mode)}):
+        raise ValueError("Access requires the exact original private or previously selected HTTPS listeners.")
     if env.get("PROXY_LAN_IP"):
-        if env["PROXY_LAN_IP"] == ip and state["overlays"][1]:
+        if env["PROXY_LAN_IP"] != ip or not state["overlays"][1]:
+            raise ValueError("Existing canonical LAN address differs from the selected Tailnet address.")
+        if before_mode == mode:
             (m.WORK / "access-noop").write_text("1\n")
-            print("Tailnet access is already configured: https://" + ip + " (native :8443)")
+            print("Tailnet access is already configured (" + mode + "): https://" + ip + " (native :8443)")
             return
-        raise ValueError("Existing LAN access differs; this command only adds access to a loopback installation.")
-    if state["overlays"][1]:
+    elif state["overlays"][1]:
         raise ValueError("Existing LAN overlay is not a loopback-only installation.")
     identifier = uuid.uuid4().hex
     root = m.STATE / "access" / identifier
@@ -197,10 +233,13 @@ def prepare(m):
     root.mkdir(mode=0o700)
     version = "access-" + identifier
     candidate = m.replace_setting(m.replace_setting(body, "PROXY_LAN_IP", ip), "STACK_VERSION", version)
+    candidate = m.replace_setting(candidate, "PROXY_HTTPS_BIND_IP", "0.0.0.0" if mode == "all-ipv4" else "")
+    candidate = m.replace_setting(candidate, "PROXY_LAN_BIND_IP", "0.0.0.0" if mode == "all-ipv4" else "")
     stage_file(root / "before.env", body, info)
     stage_file(root / "after.env", candidate, info)
     spec = {
         "id": identifier, "binding": m.selected(), "ip": ip, "version": version,
+        "listener_mode": mode, "before_listener_mode": before_mode,
         "sources": sources(m), "before": current, "config": m.config(),
         "resources": state["resources"], "owner": m.installation_owner(),
         "overlays": state["overlays"], "before_env": m.digest(body.encode()),
@@ -413,7 +452,9 @@ def guard(m, require_address=True):
     return spec
 
 
-def validate_delta(before, after, ip, version, prefixes, testing=False):
+def validate_delta(before, after, ip, version, prefixes, testing=False, listener_mode="address"):
+    if listener_mode not in ("address", "all-ipv4"):
+        raise ValueError("Unknown access listener mode.")
     expected = copy.deepcopy(before)
     for name, prefix in prefixes.items():
         expected["services"][name]["image"] = prefix + ":" + version
@@ -422,14 +463,16 @@ def validate_delta(before, after, ip, version, prefixes, testing=False):
     proxy["environment"]["CADDY_DEFAULT_SNI"] = ip
     expected["services"]["assistant-api"]["environment"]["HOMEBOX_PUBLIC_ORIGIN"] = "https://" + ip + ":8443"
     original = next(v for v in proxy["volumes"] if v["target"] == "/etc/caddy/Caddyfile")
-    base = copy.deepcopy(original)
-    original["source"] = str(Path(original["source"]).with_name("Caddyfile.lan"))
-    base["target"] = "/etc/caddy/Caddyfile.base"
-    proxy["volumes"].append(base)
+    if not any(v["target"] == "/etc/caddy/Caddyfile.base" for v in proxy["volumes"]):
+        base = copy.deepcopy(original)
+        original["source"] = str(Path(original["source"]).with_name("Caddyfile.lan"))
+        base["target"] = "/etc/caddy/Caddyfile.base"
+        proxy["volumes"].append(base)
     if not testing:
-        proxy["ports"] = (proxy.get("ports") or []) + [
-            {"mode": "ingress", "host_ip": ip, "target": port, "published": str(port), "protocol": "tcp"}
-            for port in (443, 8443)]
+        # Replace only the exact HTTPS set, never append wildcard bindings next
+        # to loopback or the canonical IP on the same host ports.
+        http = [v for v in proxy.get("ports", []) if v["target"] == 80]
+        proxy["ports"] = http + [v for v in listener_ports(ip, listener_mode) if v["target"] != 80]
     # Compose orders ports and mounts; order is not a configuration permission.
     for cfg in (expected, after):
         for service in cfg["services"].values():
@@ -449,7 +492,7 @@ def candidate(m):
             raise ValueError("Rollback configuration differs from the exact original.")
     else:
         validate_delta(spec["config"], copy.deepcopy(cfg), spec["ip"], spec["version"], m.PREFIXES,
-                       bool(os.environ.get("LC_TEST_OVERRIDE")))
+                       bool(os.environ.get("LC_TEST_OVERRIDE")), spec.get("listener_mode", "address"))
         save(m, directory(m) / "forward-config.json", cfg)
     save(m, directory(m) / "target-config.json", cfg)
     change = {**m.journal()["access_change"], "attempt": uuid.uuid4().hex}
@@ -500,6 +543,8 @@ def finish(m):
         **state, "phase": "ready", "resources": m.resource_snapshot(),
         "overlays": spec["overlays"] if rollback else [spec["overlays"][0], True, spec["overlays"][2]],
         "access_change": change,
+        "access_listener_mode": spec.get("before_listener_mode", "address") if rollback
+        else spec.get("listener_mode", "address"),
         "active_version": m.environment(body)["STACK_VERSION"],
     })
     print("Access configuration rolled back; data and images unchanged." if rollback else

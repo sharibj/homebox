@@ -60,8 +60,11 @@ tailscale ip -4
 Replace the example with the server's locally assigned Tailscale IPv4. The
 command supports the full `100.64.0.0/10` range, not a list of client addresses.
 It keeps loopback port 80/443 and adds port 443/8443 on only that selected address.
-It never binds a wildcard address or changes Tailscale, ACLs, firewall rules,
-provider settings, Ollama, or models. IPv6 is not included.
+Without `--listen-all`, it never binds a wildcard address. The explicit
+`--listen-all` mode instead publishes only the two UI HTTPS ports, 443 and 8443,
+on all IPv4 interfaces. The advertised Tailscale address remains the TLS and
+Origin identity; `0.0.0.0` is not a browser URL. Neither mode changes Tailscale,
+ACLs, firewall rules, provider settings, Ollama, or models. IPv6 is not included.
 
 Open `https://100.99.101.89` for the companion and
 `https://100.99.101.89:8443` for native Homebox. Trust the existing **public**
@@ -202,7 +205,84 @@ response. A durable attempt receipt blocks duplicate-owner signup in that state;
 verify the original login instead. Do not infer that an account is absent from a
 timeout or failed enumeration.
 
-Routine users should use a one-use invitation, not public signup:
+### Guided new account in an existing household
+
+The simplest owner-led flow is:
+
+```sh
+./deploy/homebox users create
+```
+
+Use a private interactive terminal. Sign in as the owner of the existing
+household, choose its displayed name and UUID, then enter the new member's name,
+email and password. Password entry is hidden and the new password must match
+twice. The helper refuses an insecure password-input fallback.
+
+It creates a one-use, 15-minute invitation and sends its token only in the JSON
+registration body. Native Homebox still decides whether the signed-in account
+owns that household. A read-only native-data helper supplies private ownership
+hints for the picker; hints never bypass the authenticated owner check.
+The new account is an ordinary household member, not an owner, superuser or
+AI-settings administrator. Homebox retains its normal default/personal-household
+behavior. No service restarts, registration-policy changes or inventory edits
+are needed.
+
+For automation, put two owned, nonsymlink mode-`0600` JSON files in the original
+private lifecycle state directory. The owner file needs `username` and
+`password`; the new-member file also needs `name`. Use a private editor, not
+password-bearing shell commands. Select the household explicitly:
+
+```sh
+./deploy/homebox users create --credentials-file owner-login.json \
+  --new-user-file new-member.json --collection HOUSEHOLD_UUID
+```
+
+No default household is inferred, and global `--yes` does not supply credentials
+or choose a household. Passwords and tokens must never appear in arguments,
+environment values, stdout or shared logs.
+
+A private `new-member-*.json` receipt records progress without passwords or
+invitation tokens. Once a registration request might have been sent, repeating
+the same operation performs only login and membership checks. It never silently
+repeats signup, resets a password or joins an existing account. If confirmation
+fails or membership is absent, stop and have the household owner review the
+existing account and receipt. Do not delete the receipt to force another signup.
+Native uniqueness checks remain decisive when a failed login cannot establish
+whether an account already exists.
+
+### Original account for AI settings
+
+Only the original installation account can edit the companion's **AI settings**
+page. Household ownership, superuser status and first login do not grant that
+permission. Provision its immutable identity from the installation's original
+checkout, project and private state directory:
+
+```sh
+./deploy/homebox users ai-primary
+./deploy/homebox users ai-primary --confirm-original-user-id ORIGINAL_USER_UUID
+```
+
+The first command is read-only. It displays only the unique earliest **current**
+native user UUID and creation time, never an email or password. Current ordering
+does **not** prove which account was original: an earlier account may have been
+deleted. Confirm the account's installation history before passing the explicit
+UUID. If that history is uncertain, stop. Global `--yes` is not this attestation.
+
+The second command pins that explicitly attested UUID and creation proof to the
+installation. Repeating the same confirmation is safe. A missing, tied or
+malformed native record, a different previous binding, or deletion of the pinned
+account causes refusal, not reassignment. Both commands require the canonical
+completed installation and all six healthy services, with no pending deployment,
+registration, model or access transition.
+
+The native database is read only by an ephemeral helper, never mounted into the
+assistant API. Provisioning changes no native account, role, registration flag,
+provider, image, key, CA or deployment setting. The local deployment owner
+receipt identifies installation files; it is not a native-user permission.
+
+### Separate invitations and access removal
+
+Routine users can also use a one-use invitation, not public signup:
 
 ```sh
 ./deploy/homebox users collections
@@ -239,16 +319,20 @@ inventory, and collection deletion destroys shared data.
 
 The account helper uses the native HTTP API on loopback inside Homebox's own
 container network namespace. Credentials never traverse an exposed HTTP port.
-It does not bypass native authorization or edit the database.
+It never bypasses native authorization or writes SQLite directly.
 
 ## Docker-only validation
 
 ```sh
 sh deploy/tests/check-lifecycle.sh
+sh deploy/tests/check-users.sh
 ```
 
 The unit and syntax checks mount only the new public utility sources. They use
 no Docker socket and need no real environment, inventory or credentials.
+The focused account suite adds 26 unit checks. Its retained six-service Docker
+fixture also checks original-account binding, closed-registration membership,
+uncertain signup recovery and private TTY prompts with hidden passwords.
 
 The focused `deploy/tests/access_integration.py` driver runs inside a Docker
 controller with a reviewed public-only snapshot at `/source`. It requires
@@ -269,7 +353,7 @@ The default-mode missing-volume case deliberately removes only its own empty
 assistant test volume, after a verified backup. It retains that archive and the
 remaining test data.
 
-The validated release passed 45 utility unit/syntax checks, 19 full integration
+The earlier lifecycle release passed 45 utility unit/syntax checks, 19 full integration
 checks and 7 default-installation checks. Both integration suites exited zero.
 They exercised actual native and PWA source rebuilds, old sessions, account and
 membership changes, quantity/location/attachment preservation, shared locking,
@@ -278,5 +362,6 @@ Candidate-image tests also passed 543 API tests and 130 MCP tests.
 
 No real provider, model download or inference ran. Model downloads, backup
 restoration, active real-work draining, cached-service-worker upgrades, physical
-phones, and interactive prompts were not validated. Deployment checks do not
+phones were not validated. The focused account check separately exercised
+interactive CLI prompts, not browser interactions. Deployment checks do not
 establish live model quality, provider reachability or billing.

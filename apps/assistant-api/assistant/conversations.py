@@ -8,7 +8,7 @@ import time
 
 from .actions import public
 from .clients import ServiceError
-from .images import resource_identity
+from .provider_runtime import chat_configuration, operation_for, snapshot_for
 from .schemas import ActionRequest, Intent
 from pydantic import ValidationError
 
@@ -99,7 +99,7 @@ class Conversations:
 
     def fresh_data(self, session):
         data = {"draft": None, "pending": None, "pages": {}, "lastEntities": [],
-                "provider": resource_identity(self.cfg.chat_provider_settings) + ":" + self.cfg.chat_provider_settings.model}
+                "provider": chat_configuration(snapshot_for(self.vision, self.cfg))}
         action = self.active_action(session)
         if action:
             data["draft"] = self.action_draft(session, action)
@@ -166,8 +166,9 @@ class Conversations:
     async def current(self, session):
         try:
             async with asyncio.timeout(min(10, self.cfg.chat_timeout)):
-                async with self.state.collection_lock("chat-session-" + session["id"]):
-                    return await self.current_locked(session)
+                with operation_for(self.vision):
+                    async with self.state.collection_lock("chat-session-" + session["id"]):
+                        return await self.current_locked(session)
         except TimeoutError as exc:
             raise ServiceError("conversation_busy", "A conversation turn is still being checked. Wait, then check the conversation again before confirming.", 503) from exc
 
@@ -209,13 +210,14 @@ class Conversations:
         return {"conversation": bounded_choices(data, reply), "expired": False}
 
     async def reset(self, session):
-        async with self.state.collection_lock("chat-session-" + session["id"]):
-            with self.state.connect() as db:
-                db.execute("BEGIN IMMEDIATE")
-                self.state.require_context(session, db)
-                db.execute("UPDATE conversations SET expires=0 WHERE session=?", (session["id"],))
-                db.execute("UPDATE chat_contexts SET conversation_id=NULL WHERE session=?", (session["id"],))
-            return await self.current_locked(session)
+        with operation_for(self.vision):
+            async with self.state.collection_lock("chat-session-" + session["id"]):
+                with self.state.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    self.state.require_context(session, db)
+                    db.execute("UPDATE conversations SET expires=0 WHERE session=?", (session["id"],))
+                    db.execute("UPDATE chat_contexts SET conversation_id=NULL WHERE session=?", (session["id"],))
+                return await self.current_locked(session)
 
     async def read(self, session, name, arguments=None):
         if name not in {"inventory_overview", "list_items_page", "list_destinations_page", "get_entity_card"}:
@@ -695,8 +697,9 @@ class Conversations:
     async def handle(self, session, body):
         try:
             async with asyncio.timeout(self.cfg.chat_timeout):
-                async with self.state.collection_lock("chat-session-" + session["id"]):
-                    return await self._handle(session, body)
+                with operation_for(self.vision):
+                    async with self.state.collection_lock("chat-session-" + session["id"]):
+                        return await self._handle(session, body)
         except TimeoutError as exc:
             raise ServiceError("chat_timed_out", "This turn reached its time limit. Recover the current conversation before retrying.", 503) from exc
 
@@ -751,7 +754,7 @@ class Conversations:
             count = self.state.one("SELECT count(*) AS n FROM chat_turns WHERE conversation=?", (row["id"],))["n"]
             if count >= 40:
                 raise ServiceError("conversation_limit", "This conversation reached its turn limit. Start a new conversation; existing actions remain recoverable.", 409)
-            provider = resource_identity(self.cfg.chat_provider_settings) + ":" + self.cfg.chat_provider_settings.model
+            provider = chat_configuration(snapshot_for(self.vision, self.cfg))
             if data.get("provider") != provider:
                 raise ServiceError("conversation_configuration_changed", "The chat provider changed. Start a new conversation before sending stored context.", 409)
             turn_id = opaque("turn_")
