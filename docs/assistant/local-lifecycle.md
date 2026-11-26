@@ -53,8 +53,8 @@ adoption receipt to bypass that refusal.
 
 ```sh
 ./deploy/homebox status
-tailscale ip -4
-./deploy/homebox --yes access tailscale --ip 100.99.101.89
+TAILNET_IP=$(tailscale ip -4)
+./deploy/homebox --yes access tailscale --ip "$TAILNET_IP"
 ```
 
 Replace the example with the server's locally assigned Tailscale IPv4. The
@@ -66,8 +66,8 @@ on all IPv4 interfaces. The advertised Tailscale address remains the TLS and
 Origin identity; `0.0.0.0` is not a browser URL. Neither mode changes Tailscale,
 ACLs, firewall rules, provider settings, Ollama, or models. IPv6 is not included.
 
-Open `https://100.99.101.89` for the companion and
-`https://100.99.101.89:8443` for native Homebox. Trust the existing **public**
+Open `https://<TAILNET_IP>` for the companion and
+`https://<TAILNET_IP>:8443` for native Homebox. Trust the existing **public**
 Caddy CA on each browser device. Do not bypass TLS checks or export the private
 key. Tailnet routing and ACLs must permit access; namespace tests do not prove
 that a remote device can reach the server.
@@ -97,6 +97,12 @@ the reviewed source/configuration after a drift refusal; never use reset, prune,
 key regeneration, or a data restore to change access.
 
 ## Local source redeployment
+
+For direct Wi-Fi or Ethernet access without Tailscale on the client, follow
+[Wi-Fi and Tailscale access](wi-fi-access.md). It keeps both interfaces usable
+at the same time, with precise HTTPS listeners. The first LAN activation also
+updates Native Homebox's hostname setting, from the same image, after a private
+consistent backup.
 
 For a stack installed with the older deployment helpers, first bind its existing
 healthy services to this utility. Adoption checks the actual volumes, data and

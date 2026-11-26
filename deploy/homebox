@@ -19,6 +19,7 @@ usage() {
     '  status                 Show service health and separate AI setup status' \
     '  backup                 Drain safely and retain a consistent private snapshot' \
     '  access tailscale --ip IP [--listen-all]  Add HTTPS; optionally listen on all interfaces' \
+    '  access lan --ip IP      Add/change a physical private-LAN HTTPS identity alongside Tailnet' \
     '  access resume|rollback  Recover the pending configuration-only transition' \
     '  models status|pull --confirm-download  Explicit local Ollama model setup' \
     '  users bootstrap        Explicit first-owner bootstrap for a fresh managed install' \
@@ -48,6 +49,8 @@ ACCESS_IP=
 ACCESS_LISTEN_ALL=0
 ACCESS_PHASE=
 ACCESS_ACTIVE=0
+ACCESS_LOCAL=0
+ACCESS_RECOVERY_ONLY=0
 if [ "$COMMAND" = access ]; then
   ACCESS_ACTION=${1:-}; [ "$#" -eq 0 ] || shift
   case "$ACCESS_ACTION" in
@@ -56,6 +59,10 @@ if [ "$COMMAND" = access ]; then
         [ "$1" = --ip ] || { usage >&2; exit 2; }
       ACCESS_IP=$2
       [ "$#" -ne 3 ] || ACCESS_LISTEN_ALL=1 ;;
+    lan)
+      [ "$#" -eq 2 ] && [ "$1" = --ip ] || { usage >&2; exit 2; }
+      ACCESS_IP=$2
+      ACCESS_LOCAL=1 ;;
     resume|rollback) [ "$#" -eq 0 ] || { usage >&2; exit 2; } ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -138,6 +145,21 @@ cleanup() {
   result=$?
   trap - EXIT HUP INT TERM
   if [ "$ACCESS_ACTIVE" = 1 ] && [ "$result" -ne 0 ]; then
+    if [ "$ACCESS_LOCAL" = 1 ]; then
+      if command -v access_restore_on_error >/dev/null 2>&1; then
+        # Do not call recovery in an if/|| condition: POSIX shells would disable
+        # errexit throughout its sourced recovery transaction.
+        set +e
+        access_restore_on_error
+        access_restore_result=$?
+        set -e
+        if [ "$access_restore_result" -ne 0 ]; then
+          echo "LAN recovery remains pending; use access resume or access rollback after reviewing its private journal." >&2
+        fi
+      else
+        echo "LAN recovery refused before configuration changes; the authenticated prior proxy was not stopped." >&2
+      fi
+    else
     access_pending=$(meta access-is-pending) || access_pending=1
     if [ "$access_pending" = 1 ]; then
       if capture && access_proxy=$(meta access-trusted-proxy); then
@@ -149,6 +171,7 @@ cleanup() {
       echo "Access transition is pending; ingress remains closed. Use access resume or access rollback." >&2
     else
       echo "Access committed before the reply was lost; check status or repeat access tailscale." >&2
+    fi
     fi
   fi
   if [ "$MODEL_DOWNLOAD" = 1 ]; then
@@ -202,6 +225,7 @@ meta() {
     -e "LC_MODEL_RECOVERY=$MODEL_RECOVERY" \
     -e "LC_ACCESS_ACTION=$ACCESS_ACTION" -e "LC_ACCESS_IP=$ACCESS_IP" \
     -e "LC_ACCESS_LISTEN_ALL=$ACCESS_LISTEN_ALL" \
+    -e "LC_ACCESS_RECOVERY_ONLY=$ACCESS_RECOVERY_ONLY" \
     -e "LC_ACCESS_PHASE=$ACCESS_PHASE" \
     -e "LC_TEST_OVERRIDE=$TEST_OVERRIDE" \
     --mount "type=bind,source=$ROOT,target=/source,readonly" \
@@ -237,12 +261,15 @@ capture() {
   else printf '[]\n' >"$STATE/work/volume-inspect.json"; fi
 }
 capture
-if [ "$COMMAND" = access ] && [ "$ACCESS_ACTION" != tailscale ]; then
+if [ "$COMMAND" = access ] && [ "$ACCESS_ACTION" != tailscale ] && [ "$ACCESS_ACTION" != lan ]; then
   # A prior SIGKILL may have left the detached proxy running. Authenticate and
   # close only that owned proxy before source/resource/owner/address checks.
+  ACCESS_LOCAL=$(meta access-is-local)
   access_proxy=$(meta access-trusted-proxy)
   ACCESS_ACTIVE=1
-  [ -z "$access_proxy" ] || docker stop --timeout -1 "$access_proxy"
+  if [ "$ACCESS_LOCAL" = 0 ]; then
+    [ -z "$access_proxy" ] || docker stop --timeout -1 "$access_proxy"
+  fi
   capture
   meta access-select
 else
@@ -250,8 +277,10 @@ else
 fi
 IFS= read -r EXTERNAL <"$STATE/work/external"
 IFS= read -r LAN <"$STATE/work/lan"
+IFS= read -r LOCAL_LAN <"$STATE/work/local-lan"
 dce() {
   [ -z "$TEST_OVERRIDE" ] || set -- -f "$TEST_OVERRIDE" "$@"
+  [ "$LOCAL_LAN" = 0 ] || set -- -f "$DEPLOY/docker-compose.lan-local.yml" "$@"
   [ "$LAN" = 0 ] || set -- -f "$DEPLOY/docker-compose.lan.yml" "$@"
   [ "$EXTERNAL" = 0 ] || set -- -f "$DEPLOY/docker-compose.external-ai.yml" "$@"
   set -- -f "$DEPLOY/docker-compose.yml" "$@"
@@ -473,6 +502,7 @@ if [ "$COMMAND" = backup ] || [ "$COMMAND" = redeploy ]; then
   meta phase backing-up
   archive="lifecycle-$(date -u +%Y%m%dT%H%M%SZ)-$$.tar.gz"
   HOMEBOX_BACKUP_EXTERNAL_AI="$EXTERNAL" HOMEBOX_BACKUP_LAN_HTTPS="$LAN" \
+    HOMEBOX_BACKUP_LOCAL_LAN="$LOCAL_LAN" \
     HOMEBOX_BACKUP_STOP_TIMEOUT=-1 COMPOSE_PROJECT_NAME="$PROJECT" \
     HOMEBOX_DEPLOY_DIR="$DEPLOY" HOMEBOX_ENV_FILE="$DEPLOY/.env" HOMEBOX_BACKUP_DIR="$DEPLOY/backups" \
     HOMEBOX_COMPOSE_OVERRIDE="$TEST_OVERRIDE" \

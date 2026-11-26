@@ -24,7 +24,27 @@
 
 {$HOMEBOX_HOST} {
 	import transport_security
-	reverse_proxy homebox:7745
+	@untrusted_dual_origin {
+		expression `"{$PROXY_LOCAL_LAN_IP:}" != "" && ({http.request.method} != "GET" || {http.request.header.Origin} != "") && {http.request.header.Origin} != "https://{$HOMEBOX_HOST}"`
+	}
+	route {
+		respond @untrusted_dual_origin "Origin not allowed" 403
+		reverse_proxy homebox:7745 {
+			header_up Host {$HOMEBOX_HOST}
+			header_up -Forwarded
+			header_up X-Forwarded-Host {$HOMEBOX_HOST}
+			header_up X-Forwarded-Proto https
+			header_up X-Forwarded-Port 443
+			header_up -X-Forwarded-Prefix
+			header_up -X-Forwarded-Server
+			header_up -X-Original-Host
+			header_up -X-Forwarded-Scheme
+			header_up -X-Forwarded-Ssl
+			header_up -X-Url-Scheme
+			header_up -X-Original-URL
+			header_up -X-Rewrite-URL
+		}
+	}
 }
 
 {$ASSISTANT_HOST} {
@@ -33,21 +53,32 @@
 		Permissions-Policy "camera=(self), microphone=(), geolocation=()"
 		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
 	}
+	@untrusted_dual_origin {
+		expression `"{$PROXY_LOCAL_LAN_IP:}" != "" && ({http.request.method} != "GET" || {http.request.header.Origin} != "") && {http.request.header.Origin} != "https://{$ASSISTANT_HOST}"`
+	}
 	@assistant_api path /api/assistant/v1 /api/assistant/v1/*
-	handle @assistant_api {
-		header Cache-Control no-store
-		request_body {
-			max_size 16MB
+	route {
+		respond @untrusted_dual_origin "Origin not allowed" 403
+		handle @assistant_api {
+			header Cache-Control no-store
+			request_body {
+				max_size 16MB
+			}
+			# Preserve the prefix, Cookie, Origin, CSRF, and idempotency headers.
+			reverse_proxy assistant-api:8000 {
+				header_up Host {$ASSISTANT_HOST}
+				header_up -Forwarded
+				header_up X-Forwarded-Host {$ASSISTANT_HOST}
+				header_up X-Forwarded-Proto https
+			}
 		}
-		# Preserve the prefix, Cookie, Origin, CSRF, and idempotency headers.
-		reverse_proxy assistant-api:8000
-	}
-	handle /api/* {
-		respond "Not found" 404
-	}
-	handle {
-		# Includes /t/<tagId>; the static server supplies the SPA fallback.
-		reverse_proxy pwa:8080
+		handle /api/* {
+			respond "Not found" 404
+		}
+		handle {
+			# Includes /t/<tagId>; the static server supplies the SPA fallback.
+			reverse_proxy pwa:8080
+		}
 	}
 }
 

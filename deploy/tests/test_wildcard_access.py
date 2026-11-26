@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lifecycle"))
 import access
 from test_access import candidate, configuration
 
-IP = "100.99.101.89"
+IP = "100.90.231.7"
 
 
 def wildcard(old):
@@ -51,7 +51,7 @@ class WildcardTests(unittest.TestCase):
                                               "PROXY_LAN_BIND_IP": "0.0.0.0"}), "all-ipv4")
         for overrides in ({"PROXY_HTTPS_BIND_IP": "0.0.0.0"}, {"PROXY_LAN_BIND_IP": "0.0.0.0"},
                           {"PROXY_BIND_IP": "0.0.0.0"}, {"PROXY_HTTPS_BIND_IP": "::"},
-                          {"PROXY_LAN_BIND_IP": "100.99.101.90"}):
+                          {"PROXY_LAN_BIND_IP": "100.90.231.8"}):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                 access.listener_mode({**private, **overrides})
 

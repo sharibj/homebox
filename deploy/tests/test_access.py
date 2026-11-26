@@ -58,7 +58,7 @@ class DeltaTests(unittest.TestCase):
         self.assertFalse(access.runtime_matches(Mock(), "pwa", changed, old, cfg))
 
     def test_only_exact_planned_delta(self):
-        for ip in ("100.64.0.0", "100.99.101.89", "100.127.255.255"):
+        for ip in ("100.64.0.0", "100.90.231.7", "100.127.255.255"):
             with self.subTest(ip=ip):
                 access.validate_delta(configuration(), candidate(configuration(), ip),
                                       ip, "access-example", {"assistant-api": "api"})

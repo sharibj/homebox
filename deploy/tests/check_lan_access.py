@@ -26,13 +26,21 @@ def main():
     address = str(ip)
     origin = "https://" + address
     native_origin = origin + ":8443"
+    homebox_host = os.environ.get("LAN_HOMEBOX_HOST", "homebox.localhost")
+    assistant_host = os.environ.get("LAN_ASSISTANT_HOST", "inventory.localhost")
+    homebox_origin = "https://" + homebox_host
+    assistant_origin = "https://" + assistant_host
     ca = Path(os.environ["LAN_CA_FILE"])
     context = ssl.create_default_context(cafile=str(ca))
+    local_mode = os.environ.get("LAN_DUAL_LOCAL", "0")
+    if local_mode not in ("0", "1"):
+        raise ValueError("LAN_DUAL_LOCAL must be 0 or 1")
 
     def request(port, method, path, headers=(), host=None):
         host = host or address + (":" + str(port) if port != 443 else "")
         server = host.split(":")[0]
-        with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+        target = {443: 14443, 8443: 18443}.get(port, port) if local_mode == "1" and server == address else port
+        with socket.create_connection(("127.0.0.1", target), timeout=5) as raw:
             with context.wrap_socket(raw, server_hostname=server) as secure:
                 cert = x509.load_der_x509_certificate(secure.getpeercert(binary_form=True))
                 if server == address:
@@ -58,7 +66,7 @@ def main():
     assert request(443, "POST", action, [("Origin", origin)])[0] == 401
     invalid = (
         [], [("Origin", "https://foreign.example.invalid")],
-        [("Origin", "https://inventory.localhost")], [("Origin", "null")],
+        [("Origin", assistant_origin)], [("Origin", "null")],
         [("Origin", native_origin)],
         [("Origin", origin), ("Origin", "https://foreign.example.invalid")],
         [("Origin", origin), ("Origin", origin)],
@@ -72,19 +80,19 @@ def main():
     # routes.go registers this POST with userMW; mwAuthToken returns 401 before
     # its handler without a token. Compare against the unchanged desktop alias.
     logout = "/api/v1/users/logout"
-    old_native = request(443, "POST", logout, [("Origin", "https://homebox.localhost")],
-                         host="homebox.localhost")
+    old_native = request(443, "POST", logout, [("Origin", homebox_origin)],
+                         host=homebox_host)
     lan_native = request(8443, "POST", logout, [("Origin", native_origin)])
     assert old_native[0] == 401 and lan_native == old_native
     assert request(8443, "POST", logout)[0] == 403
     assert request(8443, "POST", logout, [("Origin", origin)])[0] == 403
-    for host in ("inventory.localhost", "homebox.localhost"):
+    for host in (assistant_host, homebox_host):
         assert request(443, "GET", "/", host=host)[0] == 200
-    assert request(443, "POST", action, [("Origin", "https://inventory.localhost")],
-                   host="inventory.localhost")[0] == 401
+    assert request(443, "POST", action, [("Origin", assistant_origin)],
+                   host=assistant_host)[0] == 401
     assert request(443, "POST", action, [("Origin", "https://foreign.example.invalid")],
-                   host="inventory.localhost")[0] == 403
-    assert request(443, "POST", action, host="inventory.localhost")[0] == 403
+                   host=assistant_host)[0] == 403
+    assert request(443, "POST", action, host=assistant_host)[0] == 403
     report = {
         "status": "passed", "phoneURL": origin, "nativeHomeboxURL": native_origin,
         "TLSVerifiedWithExistingPublicCA": True, "IP_SAN": address,
@@ -98,6 +106,9 @@ def main():
         "desktopAliasesTLSAndLandingHTTP": 200,
         "desktopCanonicalPOSTHTTP": 401, "desktopMissingAndForeignOriginHTTP": 403,
         "productionLogins": 0, "inventoryWrites": 0, "modelCalls": 0,
+        "local_listener": local_mode == "1",
+        "access_attempt": os.environ.get("LAN_ACCESS_ATTEMPT", ""),
+        "access_config_sha256": os.environ.get("LAN_ACCESS_CONFIG_SHA256", ""),
     }
     if output := os.environ.get("LAN_EVIDENCE_FILE"):
         fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

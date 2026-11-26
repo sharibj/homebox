@@ -3,10 +3,15 @@
 This is an explicit access change for an existing, completed installation. It
 does not change the default loopback-only deployment.
 
+This mode is for a single Tailnet identity. For Wi-Fi and Tailscale at the same
+time, use [precise dual access](wi-fi-access.md) instead. Dual access does not
+support wildcard HTTPS listeners.
+
 After the reviewed change is installed, run this on the Linux host:
 
 ```sh
-./deploy/homebox --yes access tailscale --ip 100.99.101.89 --listen-all
+TAILNET_IP=$(tailscale ip -4)
+./deploy/homebox --yes access tailscale --ip "$TAILNET_IP" --listen-all
 ```
 
 Use the installation's normal project and state-directory options if they
@@ -36,8 +41,8 @@ It does not add IPv6 listeners.
 
 Continue to use the canonical URLs:
 
-- Companion: `https://100.99.101.89`
-- Native Homebox: `https://100.99.101.89:8443`
+- Companion: `https://<TAILNET_IP>`
+- Native Homebox: `https://<TAILNET_IP>:8443`
 
 `0.0.0.0` is a bind address, not a browser URL or certificate identity. The
 Tailnet IP stays in the certificate's IP SAN and exact Origin policy. Listening
@@ -59,7 +64,7 @@ two paired bind overrides. Existing defaults leave both blank:
 
 ```dotenv
 PROXY_BIND_IP=127.0.0.1
-PROXY_LAN_IP=100.99.101.89
+PROXY_LAN_IP=<TAILNET_IP>
 PROXY_HTTPS_BIND_IP=0.0.0.0
 PROXY_LAN_BIND_IP=0.0.0.0
 ```

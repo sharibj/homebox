@@ -14,6 +14,8 @@ CONFIG_FILES = {"config.env", "docker-compose.yml", "Caddyfile"}
 OPTIONAL_CONFIG_FILES = {
     "docker-compose.external-ai.yml", "docker-compose.external-ai-key.yml", "deployment-options.env",
     "docker-compose.lan.yml", "Caddyfile.lan",
+    "docker-compose.lan-local.yml", "Caddyfile.lan-local",
+    "docker-compose.lan-rescue.yml", "run-dual.sh", "local_lan_evidence.sh",
 }
 HOST_UID = int(os.environ["RESTORE_UID"])
 HOST_GID = int(os.environ["RESTORE_GID"])

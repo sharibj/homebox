@@ -15,7 +15,7 @@ ALLOWED = (
     "10.0.0.0", "10.23.45.67", "10.255.255.255",
     "172.16.0.0", "172.20.1.2", "172.31.255.255",
     "192.168.0.0", "192.168.1.2", "192.168.255.255",
-    "100.64.0.0", "100.99.101.89", "100.127.255.255",
+    "100.64.0.0", "100.90.231.7", "100.127.255.255",
 )
 DENIED = (
     "9.255.255.255", "11.0.0.0", "172.15.255.255", "172.32.0.0",
@@ -26,10 +26,10 @@ DENIED = (
     "224.0.0.0", "239.255.255.255", "240.0.0.0", "255.255.255.255",
     "192.0.0.1", "192.0.2.1", "198.18.0.1",
     "::", "::1", "fc00::1", "fd00::1", "2001:db8::1",
-    "::ffff:100.99.101.89",
+    "::ffff:100.90.231.7",
 )
 MALFORMED = (
-    "", "localhost", "100.99.101.89/32", "https://100.99.101.89",
+    "", "localhost", "100.90.231.7/32", "https://100.90.231.7",
     "100.064.0.1", "100.128.256.1",
 )
 
@@ -71,7 +71,7 @@ class LANAddressTests(unittest.TestCase):
                 patch.object(verifier.ssl, "create_default_context") as tls, \
                 patch.object(verifier.socket, "create_connection") as connect:
             spec.loader.exec_module(module)
-            self.assertEqual(str(module.lan_ipv4("100.99.101.89")), "100.99.101.89")
+            self.assertEqual(str(module.lan_ipv4("100.90.231.7")), "100.90.231.7")
             tls.assert_not_called()
             connect.assert_not_called()
 

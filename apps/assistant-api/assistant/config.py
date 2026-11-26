@@ -2,6 +2,7 @@ import base64
 import hashlib
 import os
 from dataclasses import dataclass, field
+from ipaddress import IPv4Address, ip_address, ip_network
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -17,6 +18,45 @@ def read_secret(name: str) -> str:
     if len(value) < 32:
         raise RuntimeError(f"{name} must point to at least 32 random characters")
     return value
+
+
+def public_origin(value: str, name: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+                or parsed.password is not None or value != "https://" + parsed.netloc
+                or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value)
+                or any(c in value for c in "*\\%")
+                or port is not None and not 1 <= port <= 65535
+                or parsed.netloc.endswith(":")):
+            raise ValueError
+        try:
+            ip_address(parsed.hostname)
+        except ValueError:
+            labels = parsed.hostname.split(".")
+            if (len(parsed.hostname) > 253 or parsed.hostname.replace(".", "").isdigit()
+                    or any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
+                           or not label.isascii() or not label.replace("-", "").isalnum() for label in labels)):
+                raise ValueError
+        return value
+    except ValueError:
+        raise RuntimeError(f"{name} must be an exact HTTPS origin without credentials, a path, query, or fragment") from None
+
+
+def lan_origin(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        parsed = urlsplit(public_origin(value, "ASSISTANT_LAN_ORIGIN"))
+        address = ip_address(parsed.hostname)
+        if (not isinstance(address, IPv4Address) or parsed.port not in (None, 443)
+                or not any(address in ip_network(network) for network in
+                           ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))):
+            raise ValueError
+        return "https://" + str(address)
+    except ValueError:
+        raise RuntimeError("ASSISTANT_LAN_ORIGIN must be an exact RFC1918 IPv4 HTTPS origin on port 443") from None
 
 
 @dataclass
@@ -52,6 +92,18 @@ class Config:
     chat_timeout: int = 60
     conversation_ttl: int = 1800
     instance_label: str = ""
+    lan_origin: str = ""
+    homebox_public_origin: str = ""
+
+    @property
+    def public_companion_origins(self):
+        origins = [self.origin]
+        if self.lan_origin:
+            origins.append(self.lan_origin)
+            if self.homebox_public_origin:
+                host = urlsplit(self.homebox_public_origin).hostname
+                origins.append("https://" + (f"[{host}]" if ":" in host else host))
+        return tuple(dict.fromkeys(origins))
 
     @property
     def provider_settings(self):
@@ -86,6 +138,12 @@ class Config:
         insecure = os.environ.get("ASSISTANT_ALLOW_INSECURE_HTTP", "false") == "true"
         if not secure and not (parsed.scheme == "http" and local and insecure):
             raise RuntimeError("HTTPS is required outside explicit loopback-only disposable tests")
+        local_origin = lan_origin(os.environ.get("ASSISTANT_LAN_ORIGIN", ""))
+        if local_origin and not secure:
+            raise RuntimeError("ASSISTANT_LAN_ORIGIN requires HTTPS for ASSISTANT_PUBLIC_ORIGIN")
+        native_origin = os.environ.get("HOMEBOX_PUBLIC_ORIGIN", "") if local_origin else ""
+        if native_origin:
+            native_origin = public_origin(native_origin, "HOMEBOX_PUBLIC_ORIGIN")
         secret = read_secret("ASSISTANT_SESSION_SECRET_FILE")
         key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
         ollama_url = os.environ.get("OLLAMA_URL", "http://ollama:11434").rstrip("/")
@@ -116,6 +174,7 @@ class Config:
             chat_timeout=int(os.environ.get("ASSISTANT_CHAT_TURN_TIMEOUT_SECONDS", "60")),
             conversation_ttl=int(os.environ.get("ASSISTANT_CONVERSATION_TTL_SECONDS", "1800")),
             instance_label=os.environ.get("ASSISTANT_INSTANCE_LABEL", "")[:100],
+            lan_origin=local_origin, homebox_public_origin=native_origin,
         )
         for name, maximum in (("analysis_queue_limit", 32), ("analysis_queue_timeout", 600),
                               ("analysis_timeout", 3600), ("capture_sync_timeout", 120),

@@ -1,0 +1,127 @@
+import /etc/caddy/Caddyfile.base
+
+(companion_security) {
+	import transport_security
+	header {
+		Permissions-Policy "camera=(self), microphone=(), geolocation=()"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+	}
+}
+
+https://{$PROXY_LAN_IP} {
+	import companion_security
+	@untrusted_nonget {
+		expression `({http.request.method} != "GET" || {http.request.header.Origin} != "") && {http.request.header.Origin} != "https://{$PROXY_LAN_IP}"`
+	}
+	@trusted_origin expression `{http.request.header.Origin} == "https://{$PROXY_LAN_IP}"`
+	@assistant_api path /api/assistant/v1 /api/assistant/v1/*
+	route {
+		respond @untrusted_nonget "Origin not allowed" 403
+		# Replace each value, rather than collapsing duplicate Origin headers.
+		request_header @trusted_origin Origin "^.*$" https://{$ASSISTANT_HOST}
+		handle @assistant_api {
+			header Cache-Control no-store
+			request_body {
+				max_size 16MB
+			}
+			reverse_proxy assistant-api:8000 {
+				header_up Host {$PROXY_LAN_IP}
+				header_up -Forwarded
+				header_up X-Forwarded-Host {$PROXY_LAN_IP}
+				header_up X-Forwarded-Proto https
+			}
+		}
+		handle /api/* {
+			respond "Not found" 404
+		}
+		handle {
+			reverse_proxy pwa:8080
+		}
+	}
+}
+
+https://{$PROXY_LAN_IP}:8443 {
+	import transport_security
+	@untrusted_nonget {
+		expression `({http.request.method} != "GET" || {http.request.header.Origin} != "") && {http.request.header.Origin} != "https://{$PROXY_LAN_IP}:8443"`
+	}
+	route {
+		respond @untrusted_nonget "Origin not allowed" 403
+		reverse_proxy homebox:7745 {
+			header_up Host {$PROXY_LAN_IP}:8443
+			header_up -Forwarded
+			header_up X-Forwarded-Host {$PROXY_LAN_IP}:8443
+			header_up X-Forwarded-Proto https
+			header_up X-Forwarded-Port 8443
+			header_up -X-Forwarded-Prefix
+			header_up -X-Forwarded-Server
+			header_up -X-Original-Host
+			header_up -X-Forwarded-Scheme
+			header_up -X-Forwarded-Ssl
+			header_up -X-Url-Scheme
+			header_up -X-Original-URL
+			header_up -X-Rewrite-URL
+		}
+	}
+}
+
+https://{$PROXY_LOCAL_LAN_IP}:14443 {
+	import companion_security
+	@untrusted_nonget {
+		expression `({http.request.method} != "GET" || {http.request.header.Origin} != "") && {http.request.header.Origin} != "https://{$PROXY_LOCAL_LAN_IP}"`
+	}
+	@assistant_api path /api/assistant/v1 /api/assistant/v1/*
+	route {
+		respond @untrusted_nonget "Origin not allowed" 403
+		# Preserve this exact Origin for the API's explicit LAN alias check.
+		handle @assistant_api {
+			header Cache-Control no-store
+			request_body {
+				max_size 16MB
+			}
+			reverse_proxy assistant-api:8000 {
+				header_up Host {$PROXY_LOCAL_LAN_IP}
+				header_up -Forwarded
+				header_up X-Forwarded-Host {$PROXY_LOCAL_LAN_IP}
+				header_up X-Forwarded-Proto https
+			}
+		}
+		handle /api/* {
+			respond "Not found" 404
+		}
+		handle {
+			reverse_proxy pwa:8080
+		}
+	}
+}
+
+https://{$PROXY_LOCAL_LAN_IP}:18443 {
+	import transport_security
+	@untrusted_nonget {
+		expression `({http.request.method} != "GET" || {http.request.header.Origin} != "") && {http.request.header.Origin} != "https://{$PROXY_LOCAL_LAN_IP}:8443"`
+	}
+	route {
+		respond @untrusted_nonget "Origin not allowed" 403
+		reverse_proxy homebox:7745 {
+			header_up Host {$PROXY_LOCAL_LAN_IP}:8443
+			header_up -Forwarded
+			header_up X-Forwarded-Host {$PROXY_LOCAL_LAN_IP}:8443
+			header_up X-Forwarded-Proto https
+			header_up X-Forwarded-Port 8443
+			header_up -X-Forwarded-Prefix
+			header_up -X-Forwarded-Server
+			header_up -X-Original-Host
+			header_up -X-Forwarded-Scheme
+			header_up -X-Forwarded-Ssl
+			header_up -X-Url-Scheme
+			header_up -X-Original-URL
+			header_up -X-Rewrite-URL
+		}
+	}
+}
+
+# Never route an unknown HTTP authority to either authenticated application.
+https://:443, https://:8443, https://:14443, https://:18443 {
+	import transport_security
+	respond "Host not allowed" 403
+}

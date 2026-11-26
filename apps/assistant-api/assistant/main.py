@@ -7,6 +7,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
@@ -141,7 +142,8 @@ def create_app(config=None, clients=None):
     async def boundary(request: Request, call_next):
         request.state.started_at = time.monotonic()
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
-            if request.headers.get("origin") != cfg.origin:
+            origins = request.headers.getlist("origin")
+            if len(origins) != 1 or origins[0] not in ({cfg.origin, cfg.lan_origin} - {""}):
                 return JSONResponse({"error": {"code": "origin_denied", "message": "A same-origin request is required."}}, 403)
         length = request.headers.get("content-length")
         if length and (not length.isdecimal() or int(length) > cfg.max_upload + 131072):
@@ -470,6 +472,27 @@ def create_app(config=None, clients=None):
     async def reset_conversation(s=Depends(session)):
         return await conversations.reset(s)
 
+    def mapping_origin(request):
+        if not cfg.lan_origin:
+            return cfg.origin
+        known_hosts = {}
+        for origin in cfg.public_companion_origins:
+            parsed = urlsplit(origin)
+            known_hosts[parsed.netloc.lower()] = origin
+            if parsed.scheme == "https" and parsed.port is None:
+                known_hosts[parsed.netloc.lower() + ":443"] = origin
+        hosts = request.headers.getlist("host")
+        origins = request.headers.getlist("origin")
+        selected = known_hosts.get(hosts[0].lower()) if len(hosts) == 1 else None
+        if (not selected or len(origins) > 1
+                or origins and origins[0] not in cfg.public_companion_origins
+                or origins and origins[0] != cfg.origin and origins[0] != selected):
+            raise ServiceError("public_origin_denied", "Use a configured Homebox Companion address.", 403)
+        return selected
+
+    def mapping_response(value, origin):
+        return {**value, "url": f"{origin}/t/{value['tagId']}"} if cfg.lan_origin else value
+
     def mapping_row(tag_id, s):
         row = state.one("SELECT * FROM mappings WHERE id=? AND collection=?", (tag_id, s["collection"]))
         if not row:
@@ -483,12 +506,14 @@ def create_app(config=None, clients=None):
         return record
 
     @app.get(PREFIX + "/tags/mappings")
-    async def mappings(s=Depends(session)):
+    async def mappings(request: Request, s=Depends(session)):
+        origin = mapping_origin(request)
         rows = state.all("SELECT data FROM mappings WHERE collection=?", (s["collection"],))
-        return {"mappings": [json.loads(v["data"]) for v in rows]}
+        return {"mappings": [mapping_response(json.loads(v["data"]), origin) for v in rows]}
 
     @app.post(PREFIX + "/tags/mappings")
-    async def create_mapping(body: MappingCreate, s=Depends(session)):
+    async def create_mapping(body: MappingCreate, request: Request, s=Depends(session)):
+        origin = mapping_origin(request)
         value = body.model_dump(mode="json")
         await validate_target(s, value)
         tag_id = "t_" + secrets.token_urlsafe(24)
@@ -496,10 +521,11 @@ def create_app(config=None, clients=None):
         value.update(tagId=tag_id, status="active", url=f"{cfg.origin}/t/{tag_id}", createdAt=now, updatedAt=now)
         state.execute("INSERT INTO mappings VALUES(?,?,?)", (tag_id, s["collection"], json.dumps(value)))
         state.audit(s, {"id": tag_id, "type": "tag.create", "payload": value}, "succeeded")
-        return value
+        return mapping_response(value, origin)
 
     @app.patch(PREFIX + "/tags/mappings/{tag_id}")
-    async def update_mapping(tag_id: str, body: MappingUpdate, s=Depends(session)):
+    async def update_mapping(tag_id: str, body: MappingUpdate, request: Request, s=Depends(session)):
+        origin = mapping_origin(request)
         value = mapping_row(tag_id, s)
         before = value.copy()
         value.update(body.model_dump(mode="json", exclude_none=True))
@@ -508,15 +534,16 @@ def create_app(config=None, clients=None):
         state.execute("UPDATE mappings SET data=? WHERE id=? AND collection=?",
                       (json.dumps(value), tag_id, s["collection"]))
         state.audit(s, {"id": tag_id, "type": "tag.update", "before": before, "result": value}, "succeeded")
-        return value
+        return mapping_response(value, origin)
 
     @app.get(PREFIX + "/tags/resolve/{tag_id}")
     async def resolve_tag(tag_id: str, request: Request, s=Depends(session)):
+        origin = mapping_origin(request)
         rate(request, "tag", 60, 60, s["actor"])
         value = mapping_row(tag_id, s)
         if value["status"] != "active":
             raise ServiceError("tag_not_found", "This tag is unknown or revoked.", 404)
-        return {"mapping": value, "entity": await validate_target(s, value)}
+        return {"mapping": mapping_response(value, origin), "entity": await validate_target(s, value)}
 
     return app
 

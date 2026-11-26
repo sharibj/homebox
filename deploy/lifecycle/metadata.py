@@ -40,7 +40,8 @@ RESERVED = {"ROOT", "DEPLOY", "PROJECT", "STATE", "PATH", "HOME", "PYTHON", "COM
             "DAEMON", "EXTERNAL", "LAN", "TEST_OVERRIDE", "YES", "RESUME", "INSTALL_LOCK",
             "REGISTRATION_RECOVERY", "MODEL_RECOVERY", "LOCKED", "PROXY_STOPPED",
             "CUTOVER", "OK", "BOOTSTRAP", "MODEL_DOWNLOAD", "SKIP_INIT", "CHANGES", "ENGINE_OS",
-            "ACCESS_ACTION", "ACCESS_IP", "ACCESS_PHASE", "ACCESS_ACTIVE", "ACCESS_LISTEN_ALL"}
+            "ACCESS_ACTION", "ACCESS_IP", "ACCESS_PHASE", "ACCESS_ACTIVE", "ACCESS_LISTEN_ALL",
+            "ACCESS_LOCAL", "ACCESS_RECOVERY_ONLY", "LOCAL_LAN"}
 
 
 def load(path, default=None):
@@ -103,8 +104,9 @@ def environment_keys():
     keys = set(environment(body)) | interpolation_keys(body)
     paths = [DEPLOY / "docker-compose.yml"]
     for flag, filename in (("external", "docker-compose.external-ai.yml"),
-                           ("lan", "docker-compose.lan.yml")):
-        if (WORK / flag).read_text().strip() == "1":
+                           ("lan", "docker-compose.lan.yml"),
+                           ("local-lan", "docker-compose.lan-local.yml")):
+        if (WORK / flag).is_file() and (WORK / flag).read_text().strip() == "1":
             paths.append(DEPLOY / filename)
     if os.environ.get("LC_TEST_OVERRIDE"):
         paths.append(TEST_COMPOSE_OVERRIDE)
@@ -318,11 +320,12 @@ def select():
         if set(current) != set(SERVICES) or any(not item["State"].get("Running")
                 or item["State"].get("Health", {}).get("Status") != "healthy" for item in current.values()):
             raise ValueError("Maintenance requires all six original healthy services; recover stopped/missing services explicitly.")
-    external = lan = False
+    external = lan = local_lan = False
     expected_base = str(Path(binding["root"]) / "deploy/docker-compose.yml")
     expected_files = {expected_base,
                       str(Path(binding["root"]) / "deploy/docker-compose.external-ai.yml"),
                       str(Path(binding["root"]) / "deploy/docker-compose.lan.yml")}
+    expected_files.add(str(Path(binding["root"]) / "deploy/docker-compose.lan-local.yml"))
     test = os.environ.get("LC_TEST_OVERRIDE")
     if test:
         expected_files.add(test)
@@ -335,6 +338,7 @@ def select():
             raise ValueError("Existing Compose paths differ. Refusing to drop an unknown overlay or adopt another checkout.")
         external |= any(p.endswith("/docker-compose.external-ai.yml") for p in files)
         lan |= any(p.endswith("/docker-compose.lan.yml") for p in files)
+        local_lan |= any(p.endswith("/docker-compose.lan-local.yml") for p in files)
     if not current and (DEPLOY / ".env").exists():
         env = environment(read_env())
         external = any(env.get(key, "ollama") not in ("", "ollama") for key in (
@@ -342,13 +346,19 @@ def select():
         external |= any(env.get(key, "") not in ("", "http://ollama:11434") for key in (
             "AI_BASE_URL", "AI_CHAT_BASE_URL", "AI_VISION_BASE_URL"))
         lan = bool(env.get("PROXY_LAN_IP"))
+        local_lan = bool(env.get("PROXY_LOCAL_LAN_IP"))
+    if local_lan and not lan:
+        raise ValueError("The private LAN identity requires the existing canonical Tailnet overlay.")
+    if old.get("local_lan_enabled", False) != local_lan and current and old.get("resources"):
+        raise ValueError("Private LAN overlay selection changed outside its explicit access transaction.")
     if old.get("overlays") and current and old["overlays"] != [external, lan, test or ""]:
         raise ValueError("Overlay selection changed from the installation receipt.")
     (WORK / "external").write_text("1\n" if external else "0\n")
     (WORK / "lan").write_text("1\n" if lan else "0\n")
+    (WORK / "local-lan").write_text("1\n" if local_lan else "0\n")
     save(WORK / "before.json", current)
     if command != "status":
-        update(binding=binding, overlays=[external, lan, test or ""],
+        update(binding=binding, overlays=[external, lan, test or ""], local_lan_enabled=local_lan,
                phase=old.get("phase", "preparing"), bootstrap_pending=old.get(
                    "bootstrap_pending", command == "fresh"))
         if command == "fresh" and owner is None:
@@ -714,8 +724,13 @@ def smoke(proof_path=None):
     origins += ["https://" + cfg["services"]["proxy"]["environment"]["HOMEBOX_HOST"]]
     if cfg["services"]["proxy"]["environment"].get("PROXY_LAN_IP"):
         origins += ["https://" + cfg["services"]["proxy"]["environment"]["PROXY_LAN_IP"]]
+    local = cfg["services"]["proxy"]["environment"].get("PROXY_LOCAL_LAN_IP", "")
+    if local:
+        origins += ["https://" + local, "https://" + local + ":8443"]
     hosts = {urllib.parse.urlsplit(value).hostname for value in origins}
     def lookup(host, port, *args, **kwargs):
+        if host == local:
+            port = {443: 14443, 8443: 18443}.get(int(port), port)
         return original("127.0.0.1" if host in hosts else host, port, *args, **kwargs)
     socket.getaddrinfo = lookup
     handler = urllib.request.build_opener(urllib.request.ProxyHandler({}),
@@ -741,10 +756,14 @@ def smoke(proof_path=None):
     companions = [companion]
     if cfg["services"]["proxy"]["environment"].get("PROXY_LAN_IP"):
         companions.append("https://" + cfg["services"]["proxy"]["environment"]["PROXY_LAN_IP"])
+    if local:
+        companions.append("https://" + local)
     native = api["HOMEBOX_PUBLIC_ORIGIN"]
     for origin in set(origins):
         get(origin + "/")
     get(native + "/api/v1/status")
+    if local:
+        get("https://" + local + ":8443/api/v1/status")
     for companion_origin in companions:
         get(companion_origin + "/api/assistant/v1/session", 401)
         action = companion_origin + "/api/assistant/v1/actions"
@@ -760,6 +779,11 @@ def smoke(proof_path=None):
     if len(companions) > 1:
         get(native + "/api/v1/users/logout", 403, method="POST")
         get(native + "/api/v1/users/logout", 403, method="POST", origin="https://foreign.example.invalid")
+    if local:
+        local_native = "https://" + local + ":8443"
+        get(local_native + "/api/v1/users/logout", 401, method="POST", origin=local_native)
+        get(local_native + "/api/v1/users/logout", 403, method="POST")
+        get(local_native + "/api/v1/users/logout", 403, method="POST", origin=native)
     save(proof_path or STATE / "releases" / journal()["candidate"] / "https-proof.json", {
         "status": "PASS", "tls_verified": True, "checks": checks,
         "no_login_or_inference": True, "cached_service_worker_upgrade": "UNVERIFIED"})
@@ -851,7 +875,8 @@ def verify_registration():
     active = dict(value.split("=", 1) for value in native["Config"]["Env"])
     if flag(active, "HBOX_OPTIONS_ALLOW_REGISTRATION") != prior:
         raise ValueError("Actual native registration does not match the recorded prior state.")
-    if protected.get("HOMEBOX_HOST") and active.get("HBOX_OPTIONS_HOSTNAME") != protected["HOMEBOX_HOST"]:
+    expected_hostname = config()["services"]["homebox"]["environment"]["HBOX_OPTIONS_HOSTNAME"]
+    if active.get("HBOX_OPTIONS_HOSTNAME") != expected_hostname:
         raise ValueError("Actual native hostname does not match protected configuration.")
     client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with client.open("http://127.0.0.1:7745/api/v1/status", timeout=10) as response:

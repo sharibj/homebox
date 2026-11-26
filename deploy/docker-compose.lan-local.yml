@@ -1,0 +1,24 @@
+# Selected only by the explicit access lan transaction, alongside the Tailnet overlay.
+services:
+  proxy:
+    command: ["/bin/sh", "/etc/caddy/run-dual.sh"]
+    environment:
+      PROXY_LOCAL_LAN_IP: ${PROXY_LOCAL_LAN_IP:?Set the locally assigned private LAN IPv4}
+    ports:
+      - "${PROXY_LOCAL_LAN_IP}:443:14443/tcp"
+      - "${PROXY_LOCAL_LAN_IP}:8443:18443/tcp"
+    volumes:
+      - ./reverse-proxy/Caddyfile.lan-local:/etc/caddy/Caddyfile:ro
+      - ./reverse-proxy/run-dual.sh:/etc/caddy/run-dual.sh:ro
+  assistant-api:
+    environment:
+      ASSISTANT_LAN_ORIGIN: https://${PROXY_LOCAL_LAN_IP}
+      HOMEBOX_PUBLIC_ORIGIN: https://${PROXY_LAN_IP}:8443
+  homebox:
+    environment:
+      # The proxy supplies an exact known host for each HTTPS identity.
+      HBOX_OPTIONS_HOSTNAME: ""
+  backup:
+    volumes:
+      - ./docker-compose.lan-local.yml:/snapshot/docker-compose.lan-local.yml:ro
+      - ./reverse-proxy/Caddyfile.lan-local:/snapshot/Caddyfile.lan-local:ro

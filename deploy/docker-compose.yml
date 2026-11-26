@@ -252,6 +252,11 @@ services:
       - ./docker-compose.lan.yml:/snapshot/docker-compose.lan.yml:ro
       - ./reverse-proxy/Caddyfile:/snapshot/Caddyfile:ro
       - ./reverse-proxy/Caddyfile.lan:/snapshot/Caddyfile.lan:ro
+      - ./docker-compose.lan-local.yml:/snapshot/docker-compose.lan-local.yml:ro
+      - ./reverse-proxy/Caddyfile.lan-local:/snapshot/Caddyfile.lan-local:ro
+      - ./docker-compose.lan-rescue.yml:/snapshot/docker-compose.lan-rescue.yml:ro
+      - ./reverse-proxy/run-dual.sh:/snapshot/run-dual.sh:ro
+      - ./lifecycle/local_lan_evidence.sh:/snapshot/local_lan_evidence.sh:ro
       - ./backups:/backups:ro
     entrypoint: ["/bin/sh", "-eu", "-c"]
     command: ["echo 'Use deploy/scripts/backup.sh, which stops writers before taking a snapshot.' >&2; exit 1"]
