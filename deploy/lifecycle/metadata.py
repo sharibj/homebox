@@ -39,7 +39,8 @@ DATA_MOUNTS = {"homebox": {"/data": "homebox_data"},
 RESERVED = {"ROOT", "DEPLOY", "PROJECT", "STATE", "PATH", "HOME", "PYTHON", "COMMAND",
             "DAEMON", "EXTERNAL", "LAN", "TEST_OVERRIDE", "YES", "RESUME", "INSTALL_LOCK",
             "REGISTRATION_RECOVERY", "MODEL_RECOVERY", "LOCKED", "PROXY_STOPPED",
-            "CUTOVER", "OK", "BOOTSTRAP", "MODEL_DOWNLOAD", "SKIP_INIT", "CHANGES", "ENGINE_OS"}
+            "CUTOVER", "OK", "BOOTSTRAP", "MODEL_DOWNLOAD", "SKIP_INIT", "CHANGES", "ENGINE_OS",
+            "ACCESS_ACTION", "ACCESS_IP", "ACCESS_PHASE", "ACCESS_ACTIVE"}
 
 
 def load(path, default=None):
@@ -280,6 +281,8 @@ def select():
         raise ValueError("Refusing symlink deployment configuration or secret directory.")
     old = journal()
     command = os.environ["LC_COMMAND"]
+    if old.get("access_change", {}).get("status") == "pending":
+        raise ValueError("Interrupted access transition. Use access resume or access rollback, not normal maintenance.")
     if old.get("binding") and old["binding"] != binding:
         legacy = {key: value for key, value in binding.items() if key != "state"}
         if command != "adopt" or old["binding"] != legacy:
@@ -696,7 +699,7 @@ def verify():
                      for name, item in current.items()}, "preservation": "PASS"})
 
 
-def smoke():
+def smoke(proof_path=None):
     cfg = config()
     api = cfg["services"]["assistant-api"]["environment"]
     context = ssl.create_default_context()
@@ -757,7 +760,7 @@ def smoke():
     if len(companions) > 1:
         get(native + "/api/v1/users/logout", 403, method="POST")
         get(native + "/api/v1/users/logout", 403, method="POST", origin="https://foreign.example.invalid")
-    save(STATE / "releases" / journal()["candidate"] / "https-proof.json", {
+    save(proof_path or STATE / "releases" / journal()["candidate"] / "https-proof.json", {
         "status": "PASS", "tls_verified": True, "checks": checks,
         "no_login_or_inference": True, "cached_service_worker_upgrade": "UNVERIFIED"})
     print("PASS: CA/hostname-verified HTTPS, native status, unauthenticated session and exact static bytes")
@@ -891,7 +894,10 @@ def semantic():
 
 def main():
     mode = sys.argv[1]
-    if mode == "select": select()
+    if mode.startswith("access-"):
+        import access
+        access.dispatch(mode, sys.modules[__name__])
+    elif mode == "select": select()
     elif mode == "init-stage": init_stage()
     elif mode == "init-install": init_install()
     elif mode == "env-keys": print("\n".join(environment_keys()))

@@ -10,14 +10,19 @@ import re
 import socket
 import ssl
 
-from cryptography import x509
+def lan_ipv4(value):
+    ip = ipaddress.ip_address(value)
+    if ip.version != 4 or not any(ip in ipaddress.ip_network(net) for net in (
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+    )):
+        raise ValueError("LAN_IP must be an RFC1918 or 100.64.0.0/10 IPv4 address")
+    return ip
 
 
 def main():
-    ip = ipaddress.ip_address(os.environ["LAN_IP"])
-    assert ip.version == 4 and any(ip in ipaddress.ip_network(net) for net in (
-        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    ))
+    ip = lan_ipv4(os.environ["LAN_IP"])
+    from cryptography import x509
+
     address = str(ip)
     origin = "https://" + address
     native_origin = origin + ":8443"

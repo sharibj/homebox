@@ -18,6 +18,8 @@ usage() {
     '  adopt                  Explicitly bind a validated existing stack to this state directory' \
     '  status                 Show service health and separate AI setup status' \
     '  backup                 Drain safely and retain a consistent private snapshot' \
+    '  access tailscale --ip IP  Add private Tailnet HTTPS to a completed installation' \
+    '  access resume|rollback  Recover the pending configuration-only transition' \
     '  models status|pull --confirm-download  Explicit local Ollama model setup' \
     '  users bootstrap        Explicit first-owner bootstrap for a fresh managed install' \
     '  users collections|members|invite|accept-invite|remove-member [OPTIONS]' \
@@ -39,6 +41,20 @@ REGISTRATION_RECOVERY=0
 if [ "$COMMAND" = users ] && [ "${1:-}" = restore-registration ]; then REGISTRATION_RECOVERY=1; fi
 MODEL_RECOVERY=0
 if [ "$COMMAND" = models ] && [ "${1:-}" = restore-network ]; then MODEL_RECOVERY=1; fi
+ACCESS_ACTION=
+ACCESS_IP=
+ACCESS_PHASE=
+ACCESS_ACTIVE=0
+if [ "$COMMAND" = access ]; then
+  ACCESS_ACTION=${1:-}; [ "$#" -eq 0 ] || shift
+  case "$ACCESS_ACTION" in
+    tailscale)
+      [ "$#" -eq 2 ] && [ "$1" = --ip ] || { usage >&2; exit 2; }
+      ACCESS_IP=$2 ;;
+    resume|rollback) [ "$#" -eq 0 ] || { usage >&2; exit 2; } ;;
+    *) usage >&2; exit 2 ;;
+  esac
+fi
 case "$PROJECT" in ""|*[!a-z0-9_-]*|[-_]*) echo "Invalid Compose project." >&2; exit 2 ;; esac
 if ! command -v docker >/dev/null 2>&1; then
   if [ -x /Applications/Docker.app/Contents/Resources/bin/docker ]; then
@@ -101,7 +117,7 @@ case "$TEST_OVERRIDE" in
   *) echo "Test override must be absolute." >&2; exit 2 ;;
 esac
 case "$COMMAND" in
-  fresh|redeploy|adopt|backup|users|models) ;;
+  fresh|redeploy|adopt|backup|users|models|access) ;;
   status) ;;
   *) usage >&2; exit 2 ;;
 esac
@@ -116,6 +132,20 @@ MODEL_DOWNLOAD=0
 cleanup() {
   result=$?
   trap - EXIT HUP INT TERM
+  if [ "$ACCESS_ACTIVE" = 1 ] && [ "$result" -ne 0 ]; then
+    access_pending=$(meta access-is-pending) || access_pending=1
+    if [ "$access_pending" = 1 ]; then
+      if capture && access_proxy=$(meta access-trusted-proxy); then
+        [ -z "$access_proxy" ] || docker stop --timeout -1 "$access_proxy" || result=1
+      else
+        echo "Cannot authenticate a proxy to stop; review the original pending installation." >&2
+        result=1
+      fi
+      echo "Access transition is pending; ingress remains closed. Use access resume or access rollback." >&2
+    else
+      echo "Access committed before the reply was lost; check status or repeat access tailscale." >&2
+    fi
+  fi
   if [ "$MODEL_DOWNLOAD" = 1 ]; then
     dce up -d --no-deps --no-build --pull never --wait --wait-timeout 180 ollama &&
       meta model-download-end || result=1
@@ -165,6 +195,8 @@ meta() {
     -e "LC_ENGINE_OS=$ENGINE_OS" \
     -e "LC_REGISTRATION_RECOVERY=$REGISTRATION_RECOVERY" \
     -e "LC_MODEL_RECOVERY=$MODEL_RECOVERY" \
+    -e "LC_ACCESS_ACTION=$ACCESS_ACTION" -e "LC_ACCESS_IP=$ACCESS_IP" \
+    -e "LC_ACCESS_PHASE=$ACCESS_PHASE" \
     -e "LC_TEST_OVERRIDE=$TEST_OVERRIDE" \
     --mount "type=bind,source=$ROOT,target=/source,readonly" \
     --mount "type=bind,source=$DEPLOY,target=/deployment" \
@@ -186,7 +218,17 @@ capture() {
   else printf '[]\n' >"$STATE/work/volume-inspect.json"; fi
 }
 capture
-meta select
+if [ "$COMMAND" = access ] && [ "$ACCESS_ACTION" != tailscale ]; then
+  # A prior SIGKILL may have left the detached proxy running. Authenticate and
+  # close only that owned proxy before source/resource/owner/address checks.
+  access_proxy=$(meta access-trusted-proxy)
+  ACCESS_ACTIVE=1
+  [ -z "$access_proxy" ] || docker stop --timeout -1 "$access_proxy"
+  capture
+  meta access-select
+else
+  meta select
+fi
 IFS= read -r EXTERNAL <"$STATE/work/external"
 IFS= read -r LAN <"$STATE/work/lan"
 dce() {
@@ -221,6 +263,10 @@ sanitize_config_environment() {
 }
 # Clear optional defaults too, before initializers or any Compose dispatch.
 sanitize_config_environment
+if [ "$COMMAND" = access ]; then
+  . "$DEPLOY/lifecycle/access.sh"
+  exit 0
+fi
 if [ "$COMMAND" = fresh ]; then
   confirm "Create or resume this new local installation (no signup/model download/CA trust)?"
   meta init-stage

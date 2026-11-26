@@ -43,6 +43,56 @@ existing installation. `fresh --resume` is only for a reviewed interrupted setup
 it preserves existing UUID/configuration/keys and refuses to regenerate missing
 encryption keys when data exists.
 
+## Add direct Tailscale access to an existing installation
+
+Use the original checkout, project, and private state directory. The installation
+must already have a completed `ready` journal, its established owner receipt,
+and all six healthy services. Healthy containers alone do not prove setup
+completed. This command refuses unfinished setup; do not reset data or invent an
+adoption receipt to bypass that refusal.
+
+```sh
+./deploy/homebox status
+tailscale ip -4
+./deploy/homebox --yes access tailscale --ip 100.99.101.89
+```
+
+Replace the example with the server's locally assigned Tailscale IPv4. The
+command supports the full `100.64.0.0/10` range, not a list of client addresses.
+It keeps loopback port 80/443 and adds port 443/8443 on only that selected address.
+It never binds a wildcard address or changes Tailscale, ACLs, firewall rules,
+provider settings, Ollama, or models. IPv6 is not included.
+
+Open `https://100.99.101.89` for the companion and
+`https://100.99.101.89:8443` for native Homebox. Trust the existing **public**
+Caddy CA on each browser device. Do not bypass TLS checks or export the private
+key. Tailnet routing and ACLs must permit access; namespace tests do not prove
+that a remote device can reach the server.
+
+This configuration-only operation retains all six exact image IDs. It can
+recreate only the API and proxy. It preserves the four other containers, data
+volumes, networks, UUID, core/provider secrets, accounts, sessions, registration
+flag, and existing CA. It builds and downloads no image or model. It records a
+private pending plan before changing configuration, closes ingress, and drains
+active work without forced cancellation. It commits the protected environment
+and receipt only after runtime, CA/hostname TLS, auth and static-byte checks.
+
+If interrupted, use one of these explicit commands:
+
+```sh
+./deploy/homebox --yes access resume
+./deploy/homebox --yes access rollback
+```
+
+Rollback applies only to a pending access operation. It restores its original
+configuration, not a database or data backup, and does not require Tailscale to
+remain available. Recovery first authenticates and closes its owned proxy before
+the remaining guards. A rejected recovery leaves that verified ingress closed.
+An uncatchable kill after a detached proxy starts can leave it running until
+recovery begins. A stale lock requires review, not automatic removal. Restore
+the reviewed source/configuration after a drift refusal; never use reset, prune,
+key regeneration, or a data restore to change access.
+
 ## Local source redeployment
 
 For a stack installed with the older deployment helpers, first bind its existing
@@ -199,6 +249,17 @@ sh deploy/tests/check-lifecycle.sh
 
 The unit and syntax checks mount only the new public utility sources. They use
 no Docker socket and need no real environment, inventory or credentials.
+
+The focused `deploy/tests/access_integration.py` driver runs inside a Docker
+controller with a reviewed public-only snapshot at `/source`. It requires
+`--workspace /absolute/new/private/path --subnet UNUSED_PRIVATE_CIDR` and
+`--image-source-project OWNED_SYNTHETIC_PROJECT`. The selected image-source
+project must start with `homebox-lifecycle-test-` and have all six cached
+application images. There is no machine-specific default. Add
+`--image-preflight-only` to read the six selected image IDs without creating or
+changing a fixture. The transition test downloads no image or model and retains
+its stopped application containers and volumes.
+
 The full harness has a separate default-installation mode. Both require a
 reviewed public-only source snapshot, a new private synthetic workspace, explicit
 non-overlapping internal subnets, and the Docker socket. Never mount a real
