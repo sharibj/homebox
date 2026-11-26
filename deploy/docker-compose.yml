@@ -237,7 +237,7 @@ services:
     tmpfs:
       - /snapshot:size=1m,mode=1777
     cap_drop: [ALL]
-    cap_add: [DAC_READ_SEARCH, CHOWN]
+    cap_add: [DAC_READ_SEARCH]
     security_opt:
       - no-new-privileges:true
     volumes:
@@ -252,7 +252,7 @@ services:
       - ./docker-compose.lan.yml:/snapshot/docker-compose.lan.yml:ro
       - ./reverse-proxy/Caddyfile:/snapshot/Caddyfile:ro
       - ./reverse-proxy/Caddyfile.lan:/snapshot/Caddyfile.lan:ro
-      - ./backups:/backups
+      - ./backups:/backups:ro
     entrypoint: ["/bin/sh", "-eu", "-c"]
     command: ["echo 'Use deploy/scripts/backup.sh, which stops writers before taking a snapshot.' >&2; exit 1"]
     cpus: 1

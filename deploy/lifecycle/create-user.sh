@@ -1,5 +1,5 @@
 # Guided registration reuses native JSON invitations; registration stays closed.
-primary_meta preflight
+primary_meta users-preflight
 IFS= read -r create_native_volume <"$STATE/work/primary-volume"
 IFS= read -r create_native_user <"$STATE/work/primary-native-user"
 IFS= read -r create_native <"$STATE/work/primary-native"
@@ -19,4 +19,4 @@ docker run --rm "$create_tty_flags" --pull never --network "container:$create_na
   --mount "type=bind,source=$STATE,target=/state" \
   "$PYTHON" python -B /source/deploy/lifecycle/accounts.py create "$@"
 capture
-primary_meta recheck
+primary_meta users-recheck

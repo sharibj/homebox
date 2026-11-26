@@ -10,6 +10,56 @@ import sys
 import uuid
 
 
+class GuardRefusal(ValueError):
+    """A fixed public reason, never a private exception or native row."""
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+GUARD_REASONS = {
+    "installation-receipt": "The canonical installation owner/resource receipts are incomplete or do not match.",
+    "deployment-not-ready": "The deployment journal is not ready. Review the unfinished deployment before creating a member.",
+    "pending-operation": "A registration, model or access operation is still pending. Complete its reviewed recovery first.",
+    "service-health": "All six original services must be running and healthy.",
+    "resource-identity": "The original volume, mount, key or installation identity could not be verified.",
+    "configuration": "The protected deployment configuration does not match the running installation.",
+    "native-volume": "The original native data volume could not be identified safely.",
+    "native-user": "The native container must declare a numeric UID/GID for the read-only database helper.",
+}
+
+
+def guarded(code, check):
+    try:
+        return check()
+    except (ValueError, KeyError, OSError):
+        raise GuardRefusal(code) from None
+
+
+def refusal(argv, error):
+    mode = argv[0] if argv else ""
+    if mode in ("users-preflight", "users-recheck", "native-owners"):
+        if isinstance(error, GuardRefusal):
+            code, reason = error.code, GUARD_REASONS[error.code]
+        elif mode == "native-owners":
+            sqlite_code = getattr(error, "sqlite_errorcode", 0)
+            sqlite_code = sqlite_code & 0xff if isinstance(sqlite_code, int) else 0
+            if sqlite_code == sqlite3.SQLITE_ERROR:
+                code = "native-owner-schema"
+                reason = "The native household ownership schema could not be queried. Verify the running native Homebox version."
+            else:
+                code = "native-owner-read"
+                reason = "Native household ownership could not be read safely. Check the native data volume, UID/GID and live WAL access."
+        else:
+            code, reason = "installation-check", "The installation readiness/identity check could not be completed safely."
+        suffix = (" Account creation may already have completed; review its private receipt before retrying."
+                  if mode == "users-recheck" else "")
+        return ("New-member creation refused [" + code + "]: " + reason + suffix
+                + " AI-primary binding is not a prerequisite for creating a member.")
+    return ("Primary-account operation refused. Check canonical ready state, unique native creation evidence, "
+            "the existing binding and explicit original-account UUID; no reassignment is allowed.")
+
+
 def canonical_uuid(value):
     if not isinstance(value, str) or str(uuid.UUID(value)) != value or uuid.UUID(value).int == 0:
         raise ValueError("A canonical, nonzero UUID is required.")
@@ -105,16 +155,18 @@ def guard(m):
     owner = m.installation_owner()
     if (not owner or not owner.get("established") or owner.get("binding") != m.selected()
             or state.get("binding") != m.selected() or not state.get("resources")):
-        raise ValueError("Use this completed installation's original canonical owner and resource receipt.")
-    if (state.get("phase") != "ready" or state.get("registration_restore") is not None
+        raise GuardRefusal("installation-receipt")
+    if state.get("phase") != "ready":
+        raise GuardRefusal("deployment-not-ready")
+    if (state.get("registration_restore") is not None
             or state.get("model_download_pending") or state.get("access_change", {}).get("status") == "pending"):
-        raise ValueError("Finish the pending deployment/registration/model/access operation first.")
+        raise GuardRefusal("pending-operation")
     current = m.containers()
     if set(current) != set(m.SERVICES) or any(not x["State"].get("Running")
             or x["State"].get("Health", {}).get("Status") != "healthy" for x in current.values()):
-        raise ValueError("All six original healthy services are required.")
-    m.check_resources()
-    m.validate_config()
+        raise GuardRefusal("service-health")
+    guarded("resource-identity", m.check_resources)
+    guarded("configuration", m.validate_config)
     return current
 
 
@@ -193,15 +245,15 @@ def main(argv):
         return
     import metadata as m
     mode = argv[0]
-    if mode == "preflight":
+    if mode in ("preflight", "users-preflight"):
         current = guard(m)
         instance = canonical_uuid(m.environment(m.read_env())["HOMEBOX_INSTANCE_ID"])
         native = next(x for x in current["homebox"]["Mounts"] if x["Destination"] == "/data")
         if native["Type"] != "volume":
-            raise ValueError("The original native data volume is required.")
+            raise GuardRefusal("native-volume")
         native_user = current["homebox"]["Config"].get("User", "")
         if not re.fullmatch(r"\d+(?::\d+)?", native_user):
-            raise ValueError("A numeric native container UID/GID is required for the read-only helper.")
+            raise GuardRefusal("native-user")
         save(m, m.WORK / "primary-context.json", {"binding": m.selected(), "owner": m.installation_owner(),
             "environment": m.file_digest(m.DEPLOY / ".env"), "instanceId": instance,
             "sources": sources(m),
@@ -224,7 +276,7 @@ def main(argv):
         proof = {**candidate, "operatorConfirmedOriginal": True}
         save(m, m.STATE / "ai-primary.json", {**proof, "status": "pending"})
         save(m, m.WORK / "primary-proof.json", proof)
-    elif mode == "recheck":
+    elif mode in ("recheck", "users-recheck"):
         unchanged(m)
     elif mode == "complete":
         unchanged(m)
@@ -241,8 +293,7 @@ def main(argv):
 if __name__ == "__main__":
     try:
         main(sys.argv[1:])
-    except (ValueError, KeyError, IndexError, OSError, sqlite3.Error):
+    except (ValueError, KeyError, IndexError, OSError, sqlite3.Error) as error:
         # Native values and database diagnostics must not become log output.
-        print("Primary-account operation refused. Check canonical ready state, unique native creation evidence, "
-              "the existing binding and explicit original-account UUID; no reassignment is allowed.", file=sys.stderr)
+        print(refusal(sys.argv[1:], error), file=sys.stderr)
         raise SystemExit(1) from None

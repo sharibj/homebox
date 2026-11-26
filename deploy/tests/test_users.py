@@ -133,6 +133,62 @@ class PrimaryEvidence(unittest.TestCase):
                 primary.main(["attest", MEMBER])
             save.assert_not_called()
 
+    def test_member_diagnostics_distinguish_readiness_and_health_without_identity_advice(self):
+        readiness = primary.refusal(["users-preflight"], primary.GuardRefusal("deployment-not-ready"))
+        health = primary.refusal(["users-preflight"], primary.GuardRefusal("service-health"))
+        self.assertIn("[deployment-not-ready]", readiness)
+        self.assertIn("[service-health]", health)
+        for text in (readiness, health):
+            self.assertIn("New-member creation refused", text)
+            self.assertNotIn("UUID", text)
+            self.assertNotIn("--confirm-original", text)
+            self.assertNotIn("Primary-account operation refused", text)
+
+    def test_native_ownership_schema_and_read_errors_are_distinct_and_sanitized(self):
+        self.database([])
+        try:
+            primary.native_owners(self.path)
+        except sqlite3.Error as error:
+            text = primary.refusal(["native-owners"], error)
+        self.assertIn("[native-owner-schema]", text)
+        self.assertNotIn("no such table", text)
+        private_error = ValueError("PRIVATE_NATIVE_ROW_PASSWORD_TOKEN")
+        text = primary.refusal(["native-owners"], private_error)
+        self.assertIn("[native-owner-read]", text)
+        self.assertNotIn("PRIVATE_NATIVE_ROW_PASSWORD_TOKEN", text)
+
+    def test_private_resource_error_is_not_exposed(self):
+        with self.assertRaises(primary.GuardRefusal) as caught:
+            primary.guarded("resource-identity", Mock(side_effect=ValueError("PRIVATE_KEY_PATH_AND_DATA")))
+        text = primary.refusal(["users-preflight"], caught.exception)
+        self.assertIn("[resource-identity]", text)
+        self.assertNotIn("PRIVATE_KEY_PATH_AND_DATA", text)
+        text = primary.refusal(["users-recheck"], ValueError("PRIVATE_KEY_PATH_AND_DATA"))
+        self.assertIn("may already have completed", text)
+        self.assertNotIn("PRIVATE_KEY_PATH_AND_DATA", text)
+
+    def test_member_preflight_accepts_legacy_API_without_any_primary_binding_check(self):
+        services = ("homebox", "assistant-api", "homebox-mcp", "pwa", "proxy", "ollama")
+        binding = {"original": True}
+        current = {name: {"Id": name, "Image": "legacy-image-without-primary-module", "HostConfig": {},
+                          "Config": {"User": "65532:65532"}, "Mounts": [],
+                          "State": {"Running": True, "StartedAt": "original-start", "Health": {"Status": "healthy"}},
+                          "NetworkSettings": {"Networks": {}}} for name in services}
+        current["homebox"]["Mounts"] = [{"Type": "volume", "Destination": "/data", "Name": "original_native"}]
+        m = SimpleNamespace(
+            WORK=Path(self.temp.name), STATE=Path(self.temp.name), SOURCE=Path(self.temp.name), DEPLOY=Path(self.temp.name),
+            SERVICES=services, selected=lambda: binding, containers=lambda: current,
+            journal=lambda: {"phase": "ready", "binding": binding, "resources": {"trusted": True}},
+            installation_owner=lambda: {"established": True, "binding": binding},
+            check_resources=Mock(), validate_config=Mock(), file_digest=lambda _: "source-digest",
+            read_env=lambda: "", environment=lambda _: {"HOMEBOX_INSTANCE_ID": INSTANCE}, save=Mock())
+        with patch.dict(sys.modules, {"metadata": m}), \
+                patch.object(primary, "binding", side_effect=AssertionError("No AI binding access")), \
+                patch.object(primary, "review", side_effect=AssertionError("No original-user review")):
+            primary.main(["users-preflight"])
+        self.assertEqual((m.WORK / "primary-api").read_text(), "assistant-api\n")
+        self.assertFalse((m.STATE / "ai-primary.json").exists())
+
     def assert_api_precision_completes(self, native_time):
         self.database([(OWNER, native_time)])
         candidate = primary.native_candidate(self.path, INSTANCE)
